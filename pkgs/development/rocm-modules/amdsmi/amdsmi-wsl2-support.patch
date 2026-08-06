@@ -1,0 +1,2089 @@
+From 0e17c7fd3e1a4f814fd47ded122c4c47382899c3 Mon Sep 17 00:00:00 2001
+From: Letian Kang <Letian.Kang@amd.com>
+Date: Sat, 13 Jun 2026 14:44:19 +0800
+Subject: [PATCH 1/2] amdsmi: add WSL2 (DirectX/dxgkrnl) GPU support via HIP
+ runtime fallback
+
+On WSL2, AMD GPUs are exposed through the DirectX paravirtualization
+layer (/dev/dxg) rather than the native amdgpu/KFD stack, so /dev/kfd and
+the amdgpu sysfs nodes are absent. As a result rsmi_init() fails during
+KFD node discovery and amdsmi_init() returns DRIVER_NOT_LOADED, leaving
+callers (and the amd-smi CLI) with no usable device.
+
+This adds an optional, self-contained WSL2 fallback that is engaged only
+when the host is detected as WSL2 and the native rsmi/KFD discovery has
+failed, so it has zero effect on bare-metal Linux:
+
+- New amd_smi_wsl.{h,cc}: detect WSL2 (microsoft/WSL kernel marker +
+  /dev/dxg present + /dev/kfd absent); enumerate GPUs and query static
+  info through the HIP runtime, dlopen'd lazily via the existing library
+  loader (no hard link against HIP, no torch). Only forward-ABI-stable
+  HIP entry points are used (hipGetDeviceCount, hipDeviceGetName,
+  hipDeviceGetPCIBusId, hipMemGetInfo, hipDeviceGetAttribute, ...),
+  avoiding version-dependent structs such as hipDeviceProp_t.
+- AMDSmiGPUDevice: WSL constructor that skips drm/ualoe init; is_wsl()/
+  get_wsl_info(); get_mutex() falls back to a static mutex on WSL.
+- AMDSmiSystem: populate_amd_gpu_devices_wsl() hooked into the discovery
+  failure path; gpu_wsl_mode_ flag so cleanup() skips rsmi_shut_down().
+- amd_smi.cc: WSL branches for get_gpu_{asic,board,vram_info,vram_usage,
+  memory_total,memory_usage,device_uuid,process_list}_info. Fields with a
+  HIP data source (market name, vendor, BDF, VRAM total/used, compute
+  units, UUID) are populated; telemetry with no WSL2 data source (power,
+  temperature, fan, clocks) keeps returning NOT_SUPPORTED.
+- amdsmi_cli/amdsmi_init.py: check_wsl2_gpu() so the CLI initializes with
+  INIT_AMD_GPUS on WSL2 instead of exiting with 'amdgpu not found'.
+
+Validated on a Radeon 8060S (gfx1151) APU under WSL2 + ROCm 7.2.4:
+amd-smi list/static/metric and the Python amdsmi interface report the
+device, VRAM usage and compute units with no errors.
+---
+ projects/amdsmi/amdsmi_cli/amdsmi_init.py     |  24 +
+ .../include/amd_smi/impl/amd_smi_gpu_device.h |  24 +-
+ .../include/amd_smi/impl/amd_smi_lib_loader.h |  17 +-
+ .../include/amd_smi/impl/amd_smi_system.h     |   6 +
+ .../amdsmi/include/amd_smi/impl/amd_smi_wsl.h | 103 +++++
+ projects/amdsmi/src/CMakeLists.txt            |   1 +
+ projects/amdsmi/src/amd_smi/amd_smi.cc        | 111 +++++
+ .../amdsmi/src/amd_smi/amd_smi_gpu_device.cc  |  22 +-
+ .../amdsmi/src/amd_smi/amd_smi_lib_loader.cc  |  13 +-
+ projects/amdsmi/src/amd_smi/amd_smi_system.cc |  65 ++-
+ projects/amdsmi/src/amd_smi/amd_smi_wsl.cc    | 427 ++++++++++++++++++
+ 11 files changed, 793 insertions(+), 20 deletions(-)
+ create mode 100644 projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h
+ create mode 100644 projects/amdsmi/src/amd_smi/amd_smi_wsl.cc
+
+diff --git a/projects/amdsmi/amdsmi_cli/amdsmi_init.py b/projects/amdsmi/amdsmi_cli/amdsmi_init.py
+index 30524dfaadb..6dc0b1a1245 100644
+--- a/projects/amdsmi/amdsmi_cli/amdsmi_init.py
++++ b/projects/amdsmi/amdsmi_cli/amdsmi_init.py
+@@ -76,6 +76,27 @@ def check_amdgpu_driver():
+     return False
+ 
+ 
++def check_wsl2_gpu():
++    """Returns true if running under WSL2 with an AMD GPU exposed via /dev/dxg.
++
++    Under WSL2 the GPU is presented through Microsoft's /dev/dxg paravirtual
++    device (WDDM/dxgkrnl) rather than the native amdgpu kernel driver, so
++    check_amdgpu_driver() above always fails. The amd-smi library, however, has
++    a HIP-runtime-backed fallback that enumerates the GPU on WSL2, so the CLI
++    should still request GPU initialization in this environment.
++
++    Detection mirrors the library's is_wsl2_environment(): a Microsoft/WSL
++    kernel marker AND /dev/dxg present AND /dev/kfd absent.
++    """
++    try:
++        proc_version = Path("/proc/version").read_text(encoding="ascii", errors="ignore").lower()
++    except OSError:
++        return False
++    if "microsoft" not in proc_version and "wsl" not in proc_version:
++        return False
++    return Path("/dev/dxg").exists() and not Path("/dev/kfd").exists()
++
++
+ def check_amd_hsmp_driver():
+     """Returns true if amd_hsmp or hsmp_acpi is found in the list of initialized modules"""
+     amd_cpu_status_file = Path("/dev/hsmp")
+@@ -127,6 +148,9 @@ def amdsmi_cli_init():
+     if check_amdgpu_driver():
+         init_flag |= amdsmi_interface.AmdSmiInitFlags.INIT_AMD_GPUS
+         logging.debug("amdgpu driver's initstate is live")
++    elif check_wsl2_gpu():
++        init_flag |= amdsmi_interface.AmdSmiInitFlags.INIT_AMD_GPUS
++        logging.debug("WSL2 GPU detected via /dev/dxg; enabling GPU init (HIP fallback)")
+     if cpu_init_disabled:
+         logging.debug("CPU/ESMI init disabled via AMDSMI_DISABLE_CPU_INIT")
+     elif check_amd_hsmp_driver() and hasattr(
+diff --git a/projects/amdsmi/include/amd_smi/impl/amd_smi_gpu_device.h b/projects/amdsmi/include/amd_smi/impl/amd_smi_gpu_device.h
+index 192930d219a..d8b10216a43 100644
+--- a/projects/amdsmi/include/amd_smi/impl/amd_smi_gpu_device.h
++++ b/projects/amdsmi/include/amd_smi/impl/amd_smi_gpu_device.h
+@@ -34,6 +34,7 @@
+ #include "amd_smi/amdsmi.h"
+ #include "amd_smi/impl/amd_smi_drm.h"
+ #include "amd_smi/impl/amd_smi_processor.h"
++#include "amd_smi/impl/amd_smi_wsl.h"
+ 
+ // Forward declaration of UALoE handle type to keep ualoe_lib/ualoe_lib.h out
+ // of the public install tree. Implementation file pulls in ualoe_lib.h.
+@@ -135,6 +136,7 @@ class AMDSmiGPUDevice : public AMDSmiProcessor {
+   // otherwise ualoe_open is skipped and fabric queries return NOT_SUPPORTED.
+   AMDSmiGPUDevice(uint32_t gpu_id, std::string path, amdsmi_bdf_t bdf, AMDSmiDrm& drm);
+   AMDSmiGPUDevice(uint32_t gpu_id, AMDSmiDrm& drm);
++  AMDSmiGPUDevice(uint32_t gpu_id, const WslGpuInfo& wsl_info, AMDSmiDrm& drm);
+   ~AMDSmiGPUDevice();
+ 
+   amdsmi_status_t get_drm_data();
+@@ -148,6 +150,12 @@ class AMDSmiGPUDevice : public AMDSmiProcessor {
+   amdsmi_bdf_t get_bdf();
+   bool check_if_drm_is_supported() { return drm_.check_if_drm_is_supported(); }
+   uint32_t get_vendor_id();
++
++  // WSL2 support: when true, this device is backed by the HIP runtime fallback
++  // (see amd_smi_wsl.h) rather than the amdgpu/KFD driver path.
++  bool is_wsl() const { return is_wsl_; }
++  const WslGpuInfo& get_wsl_info() const { return wsl_info_; }
++
+   const GPUComputeProcessList_t& amdgpu_get_compute_process_list(
+       ComputeProcessListType_t list_type = ComputeProcessListType_t::kAllProcessesOnDevice);
+   amdsmi_status_t amdgpu_query_cpu_affinity(std::string& cpu_affinity) const;
+@@ -179,11 +187,14 @@ class AMDSmiGPUDevice : public AMDSmiProcessor {
+   std::string path_;
+   amdsmi_bdf_t bdf_;
+   FabricBDFList_t fabric_bdf_list_;
+-  uint32_t vendor_id_;
++  // POD members below are normally populated by get_drm_data() during the
++  // bare-metal construction path. The WSL2 constructor skips that path, so they
++  // carry default initializers here to avoid reading indeterminate values.
++  uint32_t vendor_id_ = 0;
+   AMDSmiDrm& drm_;
+-  uint32_t card_index_;
+-  uint32_t drm_render_minor_;
+-  uint64_t kfd_gpu_id_;  // Used to decode vram usage for KFD processes
++  uint32_t card_index_ = UINT32_MAX;
++  uint32_t drm_render_minor_ = UINT32_MAX;
++  uint64_t kfd_gpu_id_ = 0;  // Used to decode vram usage for KFD processes
+   GPUComputeProcessList_t compute_process_list_;
+   std::string gpu_uuid_;  // Device UUID for UALoE identification
+   int32_t get_compute_process_list_impl(GPUComputeProcessList_t& compute_process_list,
+@@ -193,6 +204,11 @@ class AMDSmiGPUDevice : public AMDSmiProcessor {
+   void open_ualoe_session();
+   ualoe_handle_t ualoe_handle_ = (-1);
+   std::once_flag ualoe_open_once_;
++
++  // WSL2 fallback state (see amd_smi_wsl.h). Declared last so the WSL2
++  // constructor's member-initializer order matches declaration order.
++  bool is_wsl_ = false;
++  WslGpuInfo wsl_info_{};
+ };
+ 
+ }  // namespace amd::smi
+diff --git a/projects/amdsmi/include/amd_smi/impl/amd_smi_lib_loader.h b/projects/amdsmi/include/amd_smi/impl/amd_smi_lib_loader.h
+index 91a4d594452..0c835fa3b57 100644
+--- a/projects/amdsmi/include/amd_smi/impl/amd_smi_lib_loader.h
++++ b/projects/amdsmi/include/amd_smi/impl/amd_smi_lib_loader.h
+@@ -41,14 +41,14 @@ class AMDSmiLibraryLoader {
+  public:
+   AMDSmiLibraryLoader();
+ 
+-  amdsmi_status_t load(const char* filename);
++  amdsmi_status_t load(const char* filename, bool log_errors = true);
+ 
+   // Tries each candidate in order, returning success on the first that opens.
+   // Only logs once all candidates fail.
+-  amdsmi_status_t load(const std::vector<const char*>& filenames);
++  amdsmi_status_t load(const std::vector<const char*>& filenames, bool log_errors = true);
+ 
+   template <typename T>
+-  amdsmi_status_t load_symbol(T* func_handler, const char* func_name);
++  amdsmi_status_t load_symbol(T* func_handler, const char* func_name, bool log_errors = true);
+ 
+   amdsmi_status_t unload();
+ 
+@@ -61,7 +61,8 @@ class AMDSmiLibraryLoader {
+ };
+ 
+ template <typename T>
+-amdsmi_status_t AMDSmiLibraryLoader::load_symbol(T* func_handler, const char* func_name) {
++amdsmi_status_t AMDSmiLibraryLoader::load_symbol(T* func_handler, const char* func_name,
++                                                 bool log_errors) {
+   if (!libHandler_) {
+     return AMDSMI_STATUS_FAIL_LOAD_MODULE;
+   }
+@@ -74,9 +75,11 @@ amdsmi_status_t AMDSmiLibraryLoader::load_symbol(T* func_handler, const char* fu
+ 
+   *reinterpret_cast<void**>(func_handler) = dlsym(libHandler_, func_name);
+   if (*func_handler == nullptr) {
+-    char* error = dlerror();
+-    std::cerr << "AMDSmiLibraryLoader: Fail to load the symbol " << func_name << ": " << error
+-              << std::endl;
++    if (log_errors) {
++      char* error = dlerror();
++      std::cerr << "AMDSmiLibraryLoader: Fail to load the symbol " << func_name << ": " << error
++                << std::endl;
++    }
+     return AMDSMI_STATUS_FAIL_LOAD_SYMBOL;
+   }
+ 
+diff --git a/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h b/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h
+index f788a524e7e..6cb8554943d 100644
+--- a/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h
++++ b/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h
+@@ -80,12 +80,18 @@ class AMDSmiSystem {
+   */
+   amdsmi_status_t get_gpu_socket_id(uint32_t index, std::string& socketid);
+   amdsmi_status_t populate_amd_gpu_devices();
++  // WSL2 fallback: enumerate GPUs via the HIP runtime when the native
++  // amdgpu/KFD discovery is unavailable (see amd_smi_wsl.h).
++  amdsmi_status_t populate_amd_gpu_devices_wsl();
+   amdsmi_status_t populate_amd_cpus();
+   amdsmi_status_t populate_amd_ainic_devices();
+   amdsmi_status_t populate_brcm_nic_devices();
+   amdsmi_status_t populate_brcm_switch_devices();
+   uint64_t init_flag_;
+   AMDSmiDrm drm_;
++  // True when GPUs were enumerated through the WSL2 HIP fallback (rsmi was never
++  // initialized), so cleanup() must skip rsmi_shut_down(). See amd_smi_wsl.h.
++  bool gpu_wsl_mode_ = false;
+   smi_nic_ctx_t ainic_ctx_;
+   std::vector<AMDSmiAINICDevice::AINICInfo> ai_nic_info_;
+ #ifdef BRCM_NIC
+diff --git a/projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h b/projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h
+new file mode 100644
+index 00000000000..996c55de6b5
+--- /dev/null
++++ b/projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h
+@@ -0,0 +1,103 @@
++/*
++ * Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#ifndef AMD_SMI_INCLUDE_IMPL_AMD_SMI_WSL_H_
++#define AMD_SMI_INCLUDE_IMPL_AMD_SMI_WSL_H_
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "amd_smi/amdsmi.h"
++
++namespace amd::smi {
++
++/*
++ * WSL2 (Windows Subsystem for Linux) support.
++ * -----------------------------------------------------------------------------
++ * Under WSL2 an AMD GPU is exposed to the Linux guest through Microsoft's
++ * /dev/dxg paravirtual device (WDDM/dxgkrnl), NOT through the native amdgpu
++ * kernel driver. As a result none of the data sources amdsmi normally relies on
++ * are present:
++ *   - /dev/kfd is absent
++ *   - /sys/class/kfd/kfd/topology/nodes is absent
++ *   - the amdgpu sysfs nodes under /sys/class/drm/cardN/device are absent
++ *   - /sys/module/amdgpu/initstate is absent
++ *
++ * Consequently rsmi_init() (the rocm_smi backend that amdsmi_init() drives)
++ * fails during KFD node discovery and amdsmi_init() returns
++ * AMDSMI_STATUS_DRIVER_NOT_LOADED, leaving callers with no usable device handle.
++ *
++ * The HIP runtime, however, *does* work under WSL2 (it talks to the Windows
++ * driver through /dev/dxg). This module provides a minimal device-enumeration
++ * and query fallback that is backed by the HIP runtime instead of the amdgpu
++ * driver. It is engaged only when the host is detected to be WSL2 and the
++ * native rsmi/KFD discovery has failed, so it has zero effect on bare-metal
++ * Linux.
++ *
++ * The HIP runtime is loaded lazily via dlopen (see amd_smi_lib_loader.h); amdsmi
++ * does NOT link against HIP. Only a small set of forward-ABI-stable HIP entry
++ * points is used (no hipDeviceProp_t, whose layout is version dependent), so the
++ * fallback is robust across ROCm releases.
++ *
++ * Telemetry that genuinely has no WSL2 data source (power, temperature, fan,
++ * clocks, ECC, ...) keeps returning AMDSMI_STATUS_NOT_SUPPORTED.
++ */
++
++/// Cached, mostly-static information for a single HIP-visible GPU on WSL2.
++struct WslGpuInfo {
++  int hip_index = -1;                  //!< HIP device ordinal (hipSetDevice index)
++  std::string market_name;             //!< e.g. "AMD Radeon(TM) 8060S Graphics"
++  std::string bdf_string;              //!< "domain:bus:device.function" from HIP
++  amdsmi_bdf_t bdf = {};               //!< parsed BDF (0 fields if unknown)
++  uint64_t device_id = 0;              //!< PCI device id if readable, else 0
++  uint32_t num_compute_units = 0;      //!< CU count from HIP, 0 if unknown
++};
++
++/// Returns true if the current process is running inside WSL2.
++/// Detection is conservative: it requires a Microsoft/WSL kernel marker AND the
++/// /dev/dxg device, AND the absence of /dev/kfd (the native amdgpu path).
++bool is_wsl2_environment();
++
++/// Enumerate AMD GPUs visible to the HIP runtime under WSL2 and fill `out` with
++/// their cached static info. Returns AMDSMI_STATUS_SUCCESS only if the HIP
++/// runtime could be loaded and reported at least one device.
++amdsmi_status_t wsl_discover_gpus(std::vector<WslGpuInfo>* out);
++
++/// Fill an amdsmi_asic_info_t for a WSL2 device from cached HIP info.
++amdsmi_status_t wsl_fill_asic_info(const WslGpuInfo& gpu, amdsmi_asic_info_t* info);
++
++/// Fill an amdsmi_board_info_t for a WSL2 device from cached HIP info.
++amdsmi_status_t wsl_fill_board_info(const WslGpuInfo& gpu, amdsmi_board_info_t* info);
++
++/// Fill an amdsmi_vram_info_t for a WSL2 device. The VRAM size is obtained with
++/// a live hipMemGetInfo query so device enumeration does not need to create a
++/// HIP context on every GPU up front.
++amdsmi_status_t wsl_fill_vram_info(const WslGpuInfo& gpu, amdsmi_vram_info_t* info);
++
++/// Fill an amdsmi_vram_usage_t for a WSL2 device. Performs a live hipMemGetInfo
++/// query (total/used change at runtime).
++amdsmi_status_t wsl_fill_vram_usage(const WslGpuInfo& gpu, amdsmi_vram_usage_t* info);
++
++}  // namespace amd::smi
++
++#endif  // AMD_SMI_INCLUDE_IMPL_AMD_SMI_WSL_H_
+diff --git a/projects/amdsmi/src/CMakeLists.txt b/projects/amdsmi/src/CMakeLists.txt
+index dc2c762d358..856b34396ed 100644
+--- a/projects/amdsmi/src/CMakeLists.txt
++++ b/projects/amdsmi/src/CMakeLists.txt
+@@ -49,6 +49,7 @@ set(SRC_LIST
+     "${SRC_DIR}/amd_smi_ualoe.cc"
+     "${SRC_DIR}/amd_smi_utils.cc"
+     "${SRC_DIR}/amd_smi_uuid.cc"
++    "${SRC_DIR}/amd_smi_wsl.cc"
+     "${SRC_DIR}/scoped_fd.cc"
+     "${SRC_DIR}/fdinfo.cc"
+     "${CMN_SRC_LIST}"
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi.cc b/projects/amdsmi/src/amd_smi/amd_smi.cc
+index 646619579d8..1ed2cdd88de 100644
+--- a/projects/amdsmi/src/amd_smi/amd_smi.cc
++++ b/projects/amdsmi/src/amd_smi/amd_smi.cc
+@@ -68,6 +68,7 @@
+ #include "amd_smi/impl/amd_smi_test_internal.h"
+ #include "amd_smi/impl/amd_smi_utils.h"
+ #include "amd_smi/impl/amd_smi_uuid.h"
++#include "amd_smi/impl/amd_smi_wsl.h"
+ #include "amd_smi/impl/xf86drm.h"
+ #include "rocm_smi/rocm_smi.h"
+ #include "rocm_smi/rocm_smi_kfd.h"
+@@ -118,6 +119,15 @@ amdsmi_status_t rsmi_wrapper(F&& f, amdsmi_processor_handle processor_handle,
+   LOG_INFO(ss);
+   if (r != AMDSMI_STATUS_SUCCESS) return r;
+ 
++  // On WSL2 the rsmi/KFD backend is never initialized (the GPU is reached via
++  // the HIP/DirectX paravirtualization layer and rsmi reports zero devices), so
++  // every rsmi-backed query would target an out-of-range index. Short-circuit
++  // to an explicit "not supported" instead of leaning on the device-count guard
++  // below, so the WSL safety guarantee cannot silently regress.
++  if (gpu_device->is_wsl()) {
++    return AMDSMI_STATUS_NOT_SUPPORTED;
++  }
++
+   uint32_t total_num_gpu_processors = 0;
+   rsmi_num_monitor_devices(&total_num_gpu_processors);
+   uint32_t gpu_index = gpu_device->get_gpu_id() + increment_gpu_id;
+@@ -1286,6 +1296,27 @@ amdsmi_status_t amdsmi_get_gpu_device_uuid(amdsmi_processor_handle processor_han
+   amdsmi_status_t status;
+   std::ostringstream ss;
+ 
++  // On WSL2 (HIP fallback) there is no rsmi/sysfs unique-id source, so the
++  // rsmi_wrapper() calls below would return NOT_FOUND. Synthesize a
++  // deterministic UUID from the PCI device id plus a per-device serial derived
++  // from the BDF, so that identity tooling such as `amd-smi list` works and
++  // multiple GPUs do not collide on an identical UUID.
++  {
++    amd::smi::AMDSmiGPUDevice* wsl_device = nullptr;
++    if (get_gpu_device_from_handle(processor_handle, &wsl_device) == AMDSMI_STATUS_SUCCESS &&
++        wsl_device->is_wsl()) {
++      const auto& w = wsl_device->get_wsl_info();
++      uint16_t wsl_dev_id = (w.device_id != 0) ? static_cast<uint16_t>(w.device_id & 0xFFFF)
++                                               : std::numeric_limits<uint16_t>::max();
++      // Pack domain:bus:device.function into the serial so each GPU is distinct.
++      uint64_t wsl_serial = (static_cast<uint64_t>(w.bdf.bdf.domain_number) << 24) |
++                            (static_cast<uint64_t>(w.bdf.bdf.bus_number) << 16) |
++                            (static_cast<uint64_t>(w.bdf.bdf.device_number) << 8) |
++                            (static_cast<uint64_t>(w.bdf.bdf.function_number));
++      return amdsmi_uuid_gen(uuid, wsl_serial, wsl_dev_id, /*partition=*/0xff);
++    }
++  }
++
+   status = rsmi_wrapper(rsmi_dev_id_get, processor_handle, 0, &device_id);
+   if (status != AMDSMI_STATUS_SUCCESS) {
+     ss << __PRETTY_FUNCTION__
+@@ -1347,6 +1378,19 @@ amdsmi_status_t amdsmi_get_gpu_enumeration_info(amdsmi_processor_handle processo
+     return status;
+   }
+ 
++  // On WSL2 there is no DRM/KFD enumeration to report (the GPU is reached via
++  // the DirectX paravirtualization layer), so return the documented "not
++  // supported" sentinels instead of invoking rsmi, which was never initialized.
++  if (gpu_device->is_wsl()) {
++    info->drm_card = std::numeric_limits<uint32_t>::max();
++    info->drm_render = std::numeric_limits<uint32_t>::max();
++    info->hsa_id = std::numeric_limits<uint32_t>::max();
++    info->hip_id = std::numeric_limits<uint32_t>::max();
++    info->oam_id = std::numeric_limits<uint32_t>::max();
++    info->hip_uuid[0] = '\0';
++    return AMDSMI_STATUS_SUCCESS;
++  }
++
+   // Retrieve DRM Card ID
+   info->drm_card = gpu_device->get_card_id();
+ 
+@@ -1427,6 +1471,9 @@ amdsmi_status_t amdsmi_get_gpu_board_info(amdsmi_processor_handle processor_hand
+   amd::smi::AMDSmiGPUDevice* gpu_device = nullptr;
+   amdsmi_status_t r = get_gpu_device_from_handle(processor_handle, &gpu_device);
+   if (r != AMDSMI_STATUS_SUCCESS) return r;
++  if (gpu_device->is_wsl()) {
++    return amd::smi::wsl_fill_board_info(gpu_device->get_wsl_info(), board_info);
++  }
+   SMIGPUDEVICE_MUTEX(gpu_device->get_mutex())
+ 
+   status = smi_amdgpu_get_board_info(gpu_device, board_info);
+@@ -1639,6 +1686,10 @@ amdsmi_status_t amdsmi_get_gpu_vram_usage(amdsmi_processor_handle processor_hand
+     return r;
+   }
+ 
++  if (gpu_device->is_wsl()) {
++    return amd::smi::wsl_fill_vram_usage(gpu_device->get_wsl_info(), vram_info);
++  }
++
+   std::ostringstream ss;
+ 
+   SMIGPUDEVICE_MUTEX(gpu_device->get_mutex());
+@@ -2317,6 +2368,9 @@ amdsmi_status_t amdsmi_get_gpu_asic_info(amdsmi_processor_handle processor_handl
+   if (r != AMDSMI_STATUS_SUCCESS) {
+     return r;
+   }
++  if (gpu_device->is_wsl()) {
++    return amd::smi::wsl_fill_asic_info(gpu_device->get_wsl_info(), info);
++  }
+   SMIGPUDEVICE_MUTEX(gpu_device->get_mutex())
+ 
+   // ---- ASIC info cache ----
+@@ -2679,6 +2733,10 @@ amdsmi_status_t amdsmi_get_gpu_vram_info(amdsmi_processor_handle processor_handl
+     return r;
+   }
+ 
++  if (gpu_device->is_wsl()) {
++    return amd::smi::wsl_fill_vram_info(gpu_device->get_wsl_info(), info);
++  }
++
+   std::ostringstream ss;
+   // init the info structure with default value
+   info->vram_type = AMDSMI_VRAM_TYPE_UNKNOWN;
+@@ -4349,11 +4407,53 @@ amdsmi_status_t amdsmi_get_gpu_memory_reserved_pages(amdsmi_processor_handle pro
+ }
+ amdsmi_status_t amdsmi_get_gpu_memory_total(amdsmi_processor_handle processor_handle,
+                                             amdsmi_memory_type_t mem_type, uint64_t* total) {
++  {
++    amd::smi::AMDSmiGPUDevice* gpu_device = nullptr;
++    if (get_gpu_device_from_handle(processor_handle, &gpu_device) == AMDSMI_STATUS_SUCCESS &&
++        gpu_device->is_wsl()) {
++      if (total == nullptr) {
++        return AMDSMI_STATUS_INVAL;
++      }
++      // HIP (hipMemGetInfo) only exposes the device VRAM pool on WSL2; there is
++      // no separate GTT accounting, so honor the requested type explicitly.
++      if (mem_type != AMDSMI_MEM_TYPE_VRAM && mem_type != AMDSMI_MEM_TYPE_VIS_VRAM) {
++        return AMDSMI_STATUS_NOT_SUPPORTED;
++      }
++      amdsmi_vram_usage_t vu{};
++      amdsmi_status_t wr = amd::smi::wsl_fill_vram_usage(gpu_device->get_wsl_info(), &vu);
++      if (wr != AMDSMI_STATUS_SUCCESS) {
++        return wr;
++      }
++      *total = static_cast<uint64_t>(vu.vram_total) * 1024ULL * 1024ULL;
++      return AMDSMI_STATUS_SUCCESS;
++    }
++  }
+   return rsmi_wrapper(rsmi_dev_memory_total_get, processor_handle, 0,
+                       static_cast<rsmi_memory_type_t>(mem_type), total);
+ }
+ amdsmi_status_t amdsmi_get_gpu_memory_usage(amdsmi_processor_handle processor_handle,
+                                             amdsmi_memory_type_t mem_type, uint64_t* used) {
++  {
++    amd::smi::AMDSmiGPUDevice* gpu_device = nullptr;
++    if (get_gpu_device_from_handle(processor_handle, &gpu_device) == AMDSMI_STATUS_SUCCESS &&
++        gpu_device->is_wsl()) {
++      if (used == nullptr) {
++        return AMDSMI_STATUS_INVAL;
++      }
++      // HIP (hipMemGetInfo) only exposes the device VRAM pool on WSL2; there is
++      // no separate GTT accounting, so honor the requested type explicitly.
++      if (mem_type != AMDSMI_MEM_TYPE_VRAM && mem_type != AMDSMI_MEM_TYPE_VIS_VRAM) {
++        return AMDSMI_STATUS_NOT_SUPPORTED;
++      }
++      amdsmi_vram_usage_t vu{};
++      amdsmi_status_t wr = amd::smi::wsl_fill_vram_usage(gpu_device->get_wsl_info(), &vu);
++      if (wr != AMDSMI_STATUS_SUCCESS) {
++        return wr;
++      }
++      *used = static_cast<uint64_t>(vu.vram_used) * 1024ULL * 1024ULL;
++      return AMDSMI_STATUS_SUCCESS;
++    }
++  }
+   return rsmi_wrapper(rsmi_dev_memory_usage_get, processor_handle, 0,
+                       static_cast<rsmi_memory_type_t>(mem_type), used);
+ }
+@@ -5194,6 +5294,14 @@ amdsmi_status_t amdsmi_get_gpu_process_list(amdsmi_processor_handle processor_ha
+     return status_code;
+   }
+ 
++  // WSL2 has no per-process GPU accounting source (dxg paravirt exposes no
++  // KFD/sysfs proc directory), so report zero processes instead of letting
++  // amdgpu_get_compute_process_list() fail trying to open a nonexistent path.
++  if (gpu_device->is_wsl()) {
++    *max_processes = 0;
++    return AMDSMI_STATUS_SUCCESS;
++  }
++
+   // Get the list of compute processes running on the GPU
+   auto compute_process_list = gpu_device->amdgpu_get_compute_process_list();
+ 
+@@ -5250,6 +5358,9 @@ amdsmi_status_t amdsmi_get_gpu_process_list_by_pid(amdsmi_processor_handle* proc
+     amdsmi_status_t r = get_gpu_device_from_handle(processor_handles[i], &gpu_device);
+     if (r != AMDSMI_STATUS_SUCCESS) continue;
+ 
++    // WSL2 exposes no per-process GPU accounting; skip (no data source).
++    if (gpu_device->is_wsl()) continue;
++
+     uint32_t gpu_index = gpu_device->get_gpu_id();
+     auto compute_process_list = gpu_device->amdgpu_get_compute_process_list();
+ 
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi_gpu_device.cc b/projects/amdsmi/src/amd_smi/amd_smi_gpu_device.cc
+index 5f2e5ef1c08..2229e9622a7 100644
+--- a/projects/amdsmi/src/amd_smi/amd_smi_gpu_device.cc
++++ b/projects/amdsmi/src/amd_smi/amd_smi_gpu_device.cc
+@@ -92,6 +92,14 @@ ualoe_handle_t AMDSmiGPUDevice::get_ualoe_handle() {
+   return ualoe_handle_;
+ }
+ 
++AMDSmiGPUDevice::AMDSmiGPUDevice(uint32_t gpu_id, const WslGpuInfo& wsl_info, AMDSmiDrm& drm)
++    : AMDSmiProcessor(AMDSMI_PROCESSOR_TYPE_AMD_GPU),
++      gpu_id_(gpu_id),
++      bdf_(wsl_info.bdf),
++      drm_(drm),
++      is_wsl_(true),
++      wsl_info_(wsl_info) {}
++
+ AMDSmiGPUDevice::~AMDSmiGPUDevice() {
+   if (ualoe_handle_ != -1) {
+     ualoe_close(ualoe_handle_);
+@@ -169,7 +177,19 @@ amdsmi_status_t AMDSmiGPUDevice::get_drm_data() {
+   return AMDSMI_STATUS_SUCCESS;
+ }
+ 
+-pthread_mutex_t* AMDSmiGPUDevice::get_mutex() { return amd::smi::GetMutex(gpu_id_); }
++pthread_mutex_t* AMDSmiGPUDevice::get_mutex() {
++  // On the WSL2 HIP fallback path rsmi device discovery never ran, so the
++  // per-GPU mutex pool (amd::smi::GetMutex) has no entry for this index and
++  // would return nullptr -- locking it would crash. Hand out a process-wide
++  // fallback mutex instead. WSL2 GPU queries that reach the amdgpu sysfs
++  // helpers will simply find no sysfs nodes and return NOT_SUPPORTED, but they
++  // must still lock a valid mutex first.
++  if (is_wsl_) {
++    static pthread_mutex_t wsl_fallback_mutex = PTHREAD_MUTEX_INITIALIZER;
++    return &wsl_fallback_mutex;
++  }
++  return amd::smi::GetMutex(gpu_id_);
++}
+ 
+ amdsmi_status_t AMDSmiGPUDevice::amdgpu_query_cpu_affinity(std::string& cpu_affinity) const {
+   char bdf_str[20];
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi_lib_loader.cc b/projects/amdsmi/src/amd_smi/amd_smi_lib_loader.cc
+index 669a059bb4c..b8b347cfa3e 100644
+--- a/projects/amdsmi/src/amd_smi/amd_smi_lib_loader.cc
++++ b/projects/amdsmi/src/amd_smi/amd_smi_lib_loader.cc
+@@ -34,14 +34,15 @@ std::vector<const char*> libdrm_amdgpu_sonames() {
+ 
+ AMDSmiLibraryLoader::AMDSmiLibraryLoader() : libHandler_(nullptr) {}
+ 
+-amdsmi_status_t AMDSmiLibraryLoader::load(const char* filename) {
++amdsmi_status_t AMDSmiLibraryLoader::load(const char* filename, bool log_errors) {
+   if (filename == nullptr) {
+     return AMDSMI_STATUS_FAIL_LOAD_MODULE;
+   }
+-  return load(std::vector<const char*>{filename});
++  return load(std::vector<const char*>{filename}, log_errors);
+ }
+ 
+-amdsmi_status_t AMDSmiLibraryLoader::load(const std::vector<const char*>& filenames) {
++amdsmi_status_t AMDSmiLibraryLoader::load(const std::vector<const char*>& filenames,
++                                          bool log_errors) {
+   if (filenames.empty()) {
+     return AMDSMI_STATUS_FAIL_LOAD_MODULE;
+   }
+@@ -72,8 +73,10 @@ amdsmi_status_t AMDSmiLibraryLoader::load(const std::vector<const char*>& filena
+     }
+     errors += std::string(filename) + ": " + dlerror() + "; ";
+   }
+-  std::cerr << "Fail to open library (tried " << filenames.size() << " candidate(s)): " << errors
+-            << std::endl;
++  if (log_errors) {
++    std::cerr << "Fail to open library (tried " << filenames.size() << " candidate(s)): " << errors
++              << std::endl;
++  }
+   return AMDSMI_STATUS_FAIL_LOAD_MODULE;
+ }
+ 
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi_system.cc b/projects/amdsmi/src/amd_smi/amd_smi_system.cc
+index d9d41c39dc1..1a6d4c875d9 100644
+--- a/projects/amdsmi/src/amd_smi/amd_smi_system.cc
++++ b/projects/amdsmi/src/amd_smi/amd_smi_system.cc
+@@ -44,6 +44,7 @@
+ #include "amd_smi/impl/amd_smi_common.h"
+ #include "amd_smi/impl/amd_smi_test_flags.h"
+ #include "amd_smi/impl/amd_smi_utils.h"
++#include "amd_smi/impl/amd_smi_wsl.h"
+ #include "rocm_smi/rocm_smi.h"
+ #include "rocm_smi/rocm_smi_logger.h"
+ 
+@@ -362,6 +363,17 @@ amdsmi_status_t AMDSmiSystem::populate_amd_gpu_devices() {
+                             : 0ULL;
+   rsmi_status_t ret = rsmi_init(rsmi_flags);
+   if (ret != RSMI_STATUS_SUCCESS) {
++    // Under WSL2 the amdgpu kernel driver / KFD is not present (the GPU is
++    // exposed only through Microsoft's /dev/dxg), so rsmi/KFD discovery can
++    // never succeed. Fall back to a HIP-runtime-backed enumeration which does
++    // work on WSL2. This is gated on WSL2 detection so bare-metal Linux is
++    // unaffected.
++    if (is_wsl2_environment()) {
++      amdsmi_status_t wsl_status = populate_amd_gpu_devices_wsl();
++      if (wsl_status == AMDSMI_STATUS_SUCCESS) {
++        return AMDSMI_STATUS_SUCCESS;
++      }
++    }
+     if (rsmi_driver_status(&state) == RSMI_STATUS_SUCCESS &&
+         state != RSMI_DRIVER_MODULE_STATE_LIVE) {
+       return AMDSMI_STATUS_DRIVER_NOT_LOADED;
+@@ -407,6 +419,47 @@ amdsmi_status_t AMDSmiSystem::populate_amd_gpu_devices() {
+   return AMDSMI_STATUS_SUCCESS;
+ }
+ 
++amdsmi_status_t AMDSmiSystem::populate_amd_gpu_devices_wsl() {
++  std::vector<WslGpuInfo> wsl_gpus;
++  amdsmi_status_t status = wsl_discover_gpus(&wsl_gpus);
++  if (status != AMDSMI_STATUS_SUCCESS) {
++    return status;
++  }
++
++  std::ostringstream ss;
++  ss << __PRETTY_FUNCTION__ << " | WSL2 detected; HIP runtime reported " << wsl_gpus.size()
++     << " GPU(s).";
++  LOG_INFO(ss);
++
++  gpu_wsl_mode_ = true;
++
++  for (uint32_t i = 0; i < wsl_gpus.size(); i++) {
++    const WslGpuInfo& gpu = wsl_gpus[i];
++
++    // Use the BDF string as the socket id (mirrors the native path which keys
++    // sockets on the BDF); fall back to a synthetic id if unknown.
++    std::string socket_id =
++        gpu.bdf_string.empty() ? ("wsl-gpu-" + std::to_string(i)) : gpu.bdf_string;
++
++    AMDSmiSocket* socket = nullptr;
++    for (uint32_t j = 0; j < sockets_.size(); j++) {
++      if (sockets_[j]->get_socket_id() == socket_id) {
++        socket = sockets_[j];
++        break;
++      }
++    }
++    if (socket == nullptr) {
++      socket = new AMDSmiSocket(socket_id);
++      sockets_.push_back(socket);
++    }
++
++    AMDSmiProcessor* device = new AMDSmiGPUDevice(i, gpu, drm_);
++    socket->add_processor(device);
++    processors_.insert(device);
++  }
++  return AMDSMI_STATUS_SUCCESS;
++}
++
+ static amdsmi_status_t populate_amd_ainic_device(const smi_nic_ctx_t& ctx, uint64_t bdf_int,
+                                                  AMDSmiAINICDevice::AINICInfo& ai_nic_info) {
+   static_assert(sizeof(smi_nic_bus_info_t) == sizeof(ai_nic_info.bus));
+@@ -701,10 +754,16 @@ amdsmi_status_t AMDSmiSystem::cleanup() {
+       sockets_.clear();
+     }
+     drm_.cleanup();
+-    rsmi_status_t ret = rsmi_shut_down();
+-    if (ret != RSMI_STATUS_SUCCESS) {
+-      return amd::smi::rsmi_to_amdsmi_status(ret);
++    // On the WSL2 HIP fallback path rsmi_init() was never successfully called
++    // (the amdgpu/KFD driver is absent), so calling rsmi_shut_down() here would
++    // return an init error. Skip it in that case.
++    if (!gpu_wsl_mode_) {
++      rsmi_status_t ret = rsmi_shut_down();
++      if (ret != RSMI_STATUS_SUCCESS) {
++        return amd::smi::rsmi_to_amdsmi_status(ret);
++      }
+     }
++    gpu_wsl_mode_ = false;
+   }
+   if (init_flag_ & AMDSMI_INIT_AMD_NICS) {
+     smi_nic_destroy_context(ainic_ctx_);
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi_wsl.cc b/projects/amdsmi/src/amd_smi/amd_smi_wsl.cc
+new file mode 100644
+index 00000000000..cb08f027083
+--- /dev/null
++++ b/projects/amdsmi/src/amd_smi/amd_smi_wsl.cc
+@@ -0,0 +1,427 @@
++/*
++ * Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#include "amd_smi/impl/amd_smi_wsl.h"
++
++#include <unistd.h>
++
++#include <algorithm>
++#include <cctype>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <mutex>  // NOLINT(build/c++11)
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "amd_smi/impl/amd_smi_lib_loader.h"
++
++// When amdsmi happens to be compiled in a HIP-aware environment (a HIP platform
++// macro is predefined AND the runtime headers are reachable) pull in the HIP
++// attribute enum so the hardcoded fallback below can be cross-checked at build
++// time. In the normal amdsmi build (plain g++, no HIP headers on the include
++// path) neither guard holds, nothing is included, and the build is unaffected.
++#if defined(__HIP_PLATFORM_AMD__) && defined(__has_include)
++#  if __has_include(<hip/hip_runtime_api.h>)
++#    include <hip/hip_runtime_api.h>
++#    define AMDSMI_WSL_HIP_HEADERS_AVAILABLE 1
++#  endif
++#endif
++
++namespace amd::smi {
++
++namespace {
++
++// AMD/ATI PCI vendor id.
++constexpr uint32_t kAmdPciVendorId = 0x1002;
++constexpr const char* kAmdVendorName = "Advanced Micro Devices, Inc. [AMD/ATI]";
++
++// hipError_t success value (the HIP error enum is ABI-stable; hipSuccess == 0).
++constexpr int kHipSuccess = 0;
++
++// HIP runtime entry points used by the WSL2 fallback. Only forward-ABI-stable
++// signatures are bound here -- in particular hipDeviceProp_t (whose layout is
++// version dependent) is intentionally avoided.
++using pfn_hipGetDeviceCount = int (*)(int*);
++using pfn_hipDeviceGetName = int (*)(char*, int, int);
++using pfn_hipDeviceGetPCIBusId = int (*)(char*, int, int);
++using pfn_hipGetDevice = int (*)(int*);
++using pfn_hipSetDevice = int (*)(int);
++using pfn_hipMemGetInfo = int (*)(size_t*, size_t*);
++using pfn_hipDeviceGetAttribute = int (*)(int*, int, int);
++
++// hipDeviceAttributeMultiprocessorCount: ABI-stable enumerator value (== CU
++// count on AMD GPUs). Binding the value directly avoids pulling in the
++// version-dependent hipDeviceProp_t. The value is verified against ROCm's
++// hip_runtime_api.h; the static_assert below catches a future renumbering
++// whenever the HIP headers are visible at build time.
++constexpr int kHipDeviceAttributeMultiprocessorCount = 63;
++#ifdef AMDSMI_WSL_HIP_HEADERS_AVAILABLE
++static_assert(static_cast<int>(hipDeviceAttributeMultiprocessorCount) ==
++                  kHipDeviceAttributeMultiprocessorCount,
++              "HIP renumbered hipDeviceAttributeMultiprocessorCount; update "
++              "kHipDeviceAttributeMultiprocessorCount to match.");
++#endif
++
++// Lazily-loaded HIP runtime. amdsmi does not link against HIP; the library is
++// opened on demand via dlopen and is optional.
++struct HipRuntime {
++  AMDSmiLibraryLoader loader;
++  bool available = false;
++  pfn_hipGetDeviceCount GetDeviceCount = nullptr;
++  pfn_hipDeviceGetName DeviceGetName = nullptr;
++  pfn_hipDeviceGetPCIBusId DeviceGetPCIBusId = nullptr;
++  pfn_hipGetDevice GetDevice = nullptr;
++  pfn_hipSetDevice SetDevice = nullptr;
++  pfn_hipMemGetInfo MemGetInfo = nullptr;
++  pfn_hipDeviceGetAttribute DeviceGetAttribute = nullptr;  // optional
++};
++
++HipRuntime& hip_runtime() {
++  static HipRuntime rt;
++  static std::once_flag once;
++  std::call_once(once, [&]() {
++    // Prefer the unversioned dev symlink, then common SONAME versions.
++    const char* candidates[] = {
++        "libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5",
++    };
++    bool loaded = false;
++    for (const char* name : candidates) {
++      // Quietly probe each SONAME candidate: a typical WSL2 install ships only
++      // one of them, so a failed dlopen here is expected and must not emit
++      // stderr noise from a monitoring library.
++      if (rt.loader.load(name, /*log_errors=*/false) == AMDSMI_STATUS_SUCCESS) {
++        loaded = true;
++        break;
++      }
++    }
++    if (!loaded) {
++      return;
++    }
++
++    // All of these must resolve for the fallback to be usable.
++    bool ok = true;
++    ok &= rt.loader.load_symbol(&rt.GetDeviceCount, "hipGetDeviceCount") == AMDSMI_STATUS_SUCCESS;
++    ok &= rt.loader.load_symbol(&rt.DeviceGetName, "hipDeviceGetName") == AMDSMI_STATUS_SUCCESS;
++    ok &= rt.loader.load_symbol(&rt.DeviceGetPCIBusId, "hipDeviceGetPCIBusId") ==
++          AMDSMI_STATUS_SUCCESS;
++    ok &= rt.loader.load_symbol(&rt.GetDevice, "hipGetDevice") == AMDSMI_STATUS_SUCCESS;
++    ok &= rt.loader.load_symbol(&rt.SetDevice, "hipSetDevice") == AMDSMI_STATUS_SUCCESS;
++    ok &= rt.loader.load_symbol(&rt.MemGetInfo, "hipMemGetInfo") == AMDSMI_STATUS_SUCCESS;
++    // Optional, best effort: absence is acceptable, so load quietly.
++    rt.loader.load_symbol(&rt.DeviceGetAttribute, "hipDeviceGetAttribute",
++                          /*log_errors=*/false);
++    rt.available = ok;
++  });
++  return rt;
++}
++
++// Copy a std::string into a fixed-size, always-null-terminated char buffer.
++void set_fixed_string(char* dst, size_t cap, const std::string& src) {
++  if (dst == nullptr || cap == 0) {
++    return;
++  }
++  const size_t n = std::min(src.size(), cap - 1);
++  std::memcpy(dst, src.data(), n);
++  dst[n] = '\0';
++}
++
++// RAII guard that saves the current HIP device on construction and restores it
++// on destruction. amdsmi is a monitoring library and must not leave the host
++// application's per-thread current device changed after a query.
++class ScopedHipDevice {
++ public:
++  ScopedHipDevice(const HipRuntime& hip, int target) : hip_(hip) {
++    if (hip_.GetDevice != nullptr && hip_.GetDevice(&prev_) == kHipSuccess) {
++      have_prev_ = true;
++    }
++    if (hip_.SetDevice != nullptr && hip_.SetDevice(target) == kHipSuccess) {
++      set_ok_ = true;
++    }
++  }
++  ~ScopedHipDevice() {
++    if (have_prev_ && hip_.SetDevice != nullptr) {
++      hip_.SetDevice(prev_);
++    }
++  }
++  bool set_ok() const { return set_ok_; }
++
++  ScopedHipDevice(const ScopedHipDevice&) = delete;
++  ScopedHipDevice& operator=(const ScopedHipDevice&) = delete;
++
++ private:
++  const HipRuntime& hip_;
++  int prev_ = 0;
++  bool have_prev_ = false;
++  bool set_ok_ = false;
++};
++
++
++// Parse a HIP "domain:bus:device.function" string (e.g. "0000:c5:00.0") into an
++// amdsmi_bdf_t. Returns false if the string is not in the expected form.
++bool parse_pci_bus_id(const std::string& bus_id, amdsmi_bdf_t* out) {
++  unsigned int domain = 0, bus = 0, dev = 0, func = 0;
++  if (std::sscanf(bus_id.c_str(), "%x:%x:%x.%x", &domain, &bus, &dev, &func) != 4) {
++    return false;
++  }
++  amdsmi_bdf_t bdf = {};
++  // Mask the bus/device/function components to their BDF bit-field widths so the
++  // narrowing store is explicit (a well-formed PCI bus id is always in range;
++  // this also keeps the build clean under -Wconversion). domain_number is wide
++  // enough that no mask is needed.
++  bdf.bdf.domain_number = domain;
++  bdf.bdf.bus_number = bus & 0xFFu;
++  bdf.bdf.device_number = dev & 0x1Fu;
++  bdf.bdf.function_number = func & 0x7u;
++  *out = bdf;
++  return true;
++}
++
++// Best-effort read of the PCI device id from sysfs. Usually absent on WSL2 (the
++// GPU is a paravirtual /dev/dxg device), in which case 0 is returned.
++uint64_t read_pci_device_id(const std::string& bus_id) {
++  if (bus_id.empty()) {
++    return 0;
++  }
++  // sysfs uses lowercase BDF strings.
++  std::string lower = bus_id;
++  for (char& c : lower) {
++    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++  }
++  const std::string path = "/sys/bus/pci/devices/" + lower + "/device";
++  std::ifstream f(path);
++  if (!f) {
++    return 0;
++  }
++  std::string value;
++  f >> value;  // e.g. "0x1586"
++  if (value.empty()) {
++    return 0;
++  }
++  try {
++    return static_cast<uint64_t>(std::stoul(value, nullptr, 16));
++  } catch (...) {
++    return 0;
++  }
++}
++
++}  // namespace
++
++bool is_wsl2_environment() {
++  // 1. Kernel must advertise Microsoft/WSL.
++  bool kernel_is_wsl = false;
++  {
++    std::ifstream f("/proc/version");
++    std::string line;
++    if (f && std::getline(f, line)) {
++      auto contains = [&line](const char* needle) {
++        return line.find(needle) != std::string::npos;
++      };
++      kernel_is_wsl = contains("microsoft") || contains("Microsoft") || contains("WSL");
++    }
++  }
++  if (!kernel_is_wsl) {
++    return false;
++  }
++
++  // 2. The WDDM paravirtual GPU device must be present.
++  if (::access("/dev/dxg", F_OK) != 0) {
++    return false;
++  }
++
++  // 3. The native amdgpu compute path must be absent; if /dev/kfd exists the
++  //    normal amdsmi backend works and the fallback must not engage.
++  if (::access("/dev/kfd", F_OK) == 0) {
++    return false;
++  }
++
++  return true;
++}
++
++amdsmi_status_t wsl_discover_gpus(std::vector<WslGpuInfo>* out) {
++  if (out == nullptr) {
++    return AMDSMI_STATUS_INVAL;
++  }
++  out->clear();
++
++  HipRuntime& hip = hip_runtime();
++  if (!hip.available) {
++    return AMDSMI_STATUS_NOT_SUPPORTED;
++  }
++
++  int device_count = 0;
++  if (hip.GetDeviceCount(&device_count) != kHipSuccess || device_count <= 0) {
++    return AMDSMI_STATUS_NOT_SUPPORTED;
++  }
++
++  out->reserve(static_cast<size_t>(device_count));
++  for (int i = 0; i < device_count; ++i) {
++    WslGpuInfo gpu;
++    gpu.hip_index = i;
++
++    char name_buf[AMDSMI_MAX_STRING_LENGTH] = {0};
++    if (hip.DeviceGetName(name_buf, static_cast<int>(sizeof(name_buf)), i) == kHipSuccess) {
++      name_buf[sizeof(name_buf) - 1] = '\0';
++      gpu.market_name = name_buf;
++    }
++
++    char bdf_buf[64] = {0};
++    if (hip.DeviceGetPCIBusId(bdf_buf, static_cast<int>(sizeof(bdf_buf)), i) == kHipSuccess) {
++      bdf_buf[sizeof(bdf_buf) - 1] = '\0';
++      gpu.bdf_string = bdf_buf;
++      parse_pci_bus_id(gpu.bdf_string, &gpu.bdf);
++      gpu.device_id = read_pci_device_id(gpu.bdf_string);
++    }
++
++    // VRAM total is intentionally NOT queried here. hipMemGetInfo requires a
++    // current device, and calling hipSetDevice on every GPU during enumeration
++    // would force a primary HIP context to be created on each one just to list
++    // devices -- an undesirable side effect for a monitoring library. The size
++    // is fetched lazily in wsl_fill_vram_info() instead.
++
++    // Compute-unit count via the ABI-stable attribute query (best effort).
++    if (hip.DeviceGetAttribute != nullptr) {
++      int cu = 0;
++      if (hip.DeviceGetAttribute(&cu, kHipDeviceAttributeMultiprocessorCount, i) ==
++              kHipSuccess &&
++          cu > 0) {
++        gpu.num_compute_units = static_cast<uint32_t>(cu);
++      }
++    }
++
++    out->push_back(std::move(gpu));
++  }
++
++  if (out->empty()) {
++    return AMDSMI_STATUS_NOT_SUPPORTED;
++  }
++  return AMDSMI_STATUS_SUCCESS;
++}
++
++amdsmi_status_t wsl_fill_asic_info(const WslGpuInfo& gpu, amdsmi_asic_info_t* info) {
++  if (info == nullptr) {
++    return AMDSMI_STATUS_INVAL;
++  }
++  *info = {};
++  // Default every field to its documented "not supported" sentinel.
++  info->market_name[0] = '\0';
++  info->vendor_id = std::numeric_limits<uint32_t>::max();
++  info->vendor_name[0] = '\0';
++  info->subvendor_id = std::numeric_limits<uint32_t>::max();
++  info->device_id = std::numeric_limits<uint64_t>::max();
++  info->rev_id = std::numeric_limits<uint32_t>::max();
++  info->asic_serial[0] = '\0';
++  info->oam_id = std::numeric_limits<uint32_t>::max();
++  info->num_of_compute_units = std::numeric_limits<uint32_t>::max();
++  info->target_graphics_version = std::numeric_limits<uint64_t>::max();
++  info->subsystem_id = std::numeric_limits<uint32_t>::max();
++  info->flags = 0;
++
++  if (!gpu.market_name.empty()) {
++    set_fixed_string(info->market_name, AMDSMI_MAX_STRING_LENGTH, gpu.market_name);
++  }
++  info->vendor_id = kAmdPciVendorId;
++  set_fixed_string(info->vendor_name, AMDSMI_MAX_STRING_LENGTH, kAmdVendorName);
++  if (gpu.device_id != 0) {
++    info->device_id = gpu.device_id;
++  }
++  if (gpu.num_compute_units != 0) {
++    info->num_of_compute_units = gpu.num_compute_units;
++  }
++  return AMDSMI_STATUS_SUCCESS;
++}
++
++amdsmi_status_t wsl_fill_board_info(const WslGpuInfo& gpu, amdsmi_board_info_t* info) {
++  if (info == nullptr) {
++    return AMDSMI_STATUS_INVAL;
++  }
++  *info = {};
++  info->model_number[0] = '\0';
++  info->product_serial[0] = '\0';
++  info->fru_id[0] = '\0';
++  info->product_name[0] = '\0';
++  info->manufacturer_name[0] = '\0';
++
++  if (!gpu.market_name.empty()) {
++    set_fixed_string(info->product_name, AMDSMI_MAX_STRING_LENGTH, gpu.market_name);
++  }
++  set_fixed_string(info->manufacturer_name, AMDSMI_MAX_STRING_LENGTH, kAmdVendorName);
++  return AMDSMI_STATUS_SUCCESS;
++}
++
++amdsmi_status_t wsl_fill_vram_info(const WslGpuInfo& gpu, amdsmi_vram_info_t* info) {
++  if (info == nullptr) {
++    return AMDSMI_STATUS_INVAL;
++  }
++  *info = {};
++  info->vram_type = AMDSMI_VRAM_TYPE_UNKNOWN;
++  info->vram_vendor[0] = '\0';
++  info->vram_bit_width = std::numeric_limits<uint32_t>::max();
++  info->vram_max_bandwidth = std::numeric_limits<uint64_t>::max();
++
++  // VRAM size is queried live (instead of being cached during enumeration) so
++  // that merely listing devices does not create a HIP context on every GPU.
++  HipRuntime& hip = hip_runtime();
++  if (!hip.available) {
++    return AMDSMI_STATUS_NOT_SUPPORTED;
++  }
++  ScopedHipDevice dev_guard(hip, gpu.hip_index);
++  if (!dev_guard.set_ok()) {
++    return AMDSMI_STATUS_API_FAILED;
++  }
++  size_t free_bytes = 0, total_bytes = 0;
++  if (hip.MemGetInfo(&free_bytes, &total_bytes) != kHipSuccess) {
++    return AMDSMI_STATUS_API_FAILED;
++  }
++  // hipMemGetInfo reports bytes; amdsmi_vram_info_t.vram_size is in MB.
++  info->vram_size = total_bytes / (1024ULL * 1024ULL);
++  return AMDSMI_STATUS_SUCCESS;
++}
++
++amdsmi_status_t wsl_fill_vram_usage(const WslGpuInfo& gpu, amdsmi_vram_usage_t* info) {
++  if (info == nullptr) {
++    return AMDSMI_STATUS_INVAL;
++  }
++  *info = {};
++
++  HipRuntime& hip = hip_runtime();
++  if (!hip.available) {
++    return AMDSMI_STATUS_NOT_SUPPORTED;
++  }
++  ScopedHipDevice dev_guard(hip, gpu.hip_index);
++  if (!dev_guard.set_ok()) {
++    return AMDSMI_STATUS_API_FAILED;
++  }
++  size_t free_bytes = 0, total_bytes = 0;
++  if (hip.MemGetInfo(&free_bytes, &total_bytes) != kHipSuccess) {
++    return AMDSMI_STATUS_API_FAILED;
++  }
++  const uint64_t used_bytes = (total_bytes >= free_bytes) ? (total_bytes - free_bytes) : 0;
++  info->vram_total = static_cast<uint32_t>(total_bytes / (1024ULL * 1024ULL));
++  info->vram_used = static_cast<uint32_t>(used_bytes / (1024ULL * 1024ULL));
++  return AMDSMI_STATUS_SUCCESS;
++}
++
++}  // namespace amd::smi
+
+From 246fe4bd43bff025a7c457b20faa3f008509af58 Mon Sep 17 00:00:00 2001
+From: Letian Kang <Letian.Kang@amd.com>
+Date: Wed, 15 Jul 2026 17:29:53 +0800
+Subject: [PATCH 2/2] amdsmi: address WSL2 review feedback
+
+---
+ projects/amdsmi/CHANGELOG.md                  |   6 +
+ projects/amdsmi/amdsmi_cli/amdsmi_init.py     |   6 +-
+ projects/amdsmi/docs/install/install.md       |  36 ++-
+ .../include/amd_smi/impl/amd_smi_system.h     |   4 +-
+ .../amd_smi/impl/amd_smi_test_internal.h      |  23 ++
+ .../amdsmi/include/amd_smi/impl/amd_smi_wsl.h |  26 ++-
+ projects/amdsmi/src/amd_smi/amd_smi.cc        |  88 ++++----
+ projects/amdsmi/src/amd_smi/amd_smi_system.cc |  15 +-
+ projects/amdsmi/src/amd_smi/amd_smi_wsl.cc    | 129 +++++++----
+ .../tests/amd_smi_test/functional/wsl.cc      | 212 ++++++++++++++++++
+ .../python/unit/system/test_wsl_detection.py  | 133 +++++++++++
+ 11 files changed, 570 insertions(+), 108 deletions(-)
+ create mode 100644 projects/amdsmi/tests/amd_smi_test/functional/wsl.cc
+ create mode 100644 projects/amdsmi/tests/python/unit/system/test_wsl_detection.py
+
+diff --git a/projects/amdsmi/CHANGELOG.md b/projects/amdsmi/CHANGELOG.md
+index 322187512b3..dc4cc3f31fb 100644
+--- a/projects/amdsmi/CHANGELOG.md
++++ b/projects/amdsmi/CHANGELOG.md
+@@ -8,6 +8,12 @@ Full documentation for amd_smi_lib is available at [https://rocm.docs.amd.com/pr
+ 
+ ### Added
+ 
++- **Added AMD GPU support on WSL2 through the HIP runtime**. AMD SMI can initialize and
++  enumerate GPUs exposed through `/dev/dxg` when the native `amdgpu`/KFD interfaces are
++  unavailable. Identity, board, VRAM, UUID, BDF, and enumeration information is available where
++  the HIP runtime provides a data source. Hardware telemetry and management features without a
++  WSL2 data source continue to report `AMDSMI_STATUS_NOT_SUPPORTED`.
++
+ - **Added NIC processor discovery and information API surface**.  
+   - New C APIs: `amdsmi_get_nic_processor_handles()`, `amdsmi_get_nic_device_bdf()`, `amdsmi_get_nic_fw_info()`, `amdsmi_get_nic_port_statistics()`, and `amdsmi_get_nic_vendor_statistics()`.
+   - `amdsmi_get_nic_processor_handles()` enumerates NIC processors by socket; the BDF, firmware, and port/vendor statistics getters are reserved and currently return `AMDSMI_STATUS_NOT_YET_IMPLEMENTED`.
+diff --git a/projects/amdsmi/amdsmi_cli/amdsmi_init.py b/projects/amdsmi/amdsmi_cli/amdsmi_init.py
+index 6dc0b1a1245..ba0e0146633 100644
+--- a/projects/amdsmi/amdsmi_cli/amdsmi_init.py
++++ b/projects/amdsmi/amdsmi_cli/amdsmi_init.py
+@@ -23,11 +23,10 @@
+ 
+ import atexit
+ import logging
++import os
+ import signal
+ import sys
+-import os
+ import threading
+-
+ from pathlib import Path
+ 
+ current_path = os.path.dirname(os.path.abspath(__file__))
+@@ -36,7 +35,7 @@
+ # Prioritize the library from this installation over any pip-installed version
+ 
+ try:
+-    from amdsmi import amdsmi_interface, amdsmi_exception
++    from amdsmi import amdsmi_exception, amdsmi_interface
+ except ImportError as e:
+     print(f"Unhandled import error: {e}")
+     print("Failed to import the amdsmi Python library. Ensure it is installed in Python.")
+@@ -88,6 +87,7 @@ def check_wsl2_gpu():
+     Detection mirrors the library's is_wsl2_environment(): a Microsoft/WSL
+     kernel marker AND /dev/dxg present AND /dev/kfd absent.
+     """
++    # Keep in sync with amd::smi::is_wsl2_environment().
+     try:
+         proc_version = Path("/proc/version").read_text(encoding="ascii", errors="ignore").lower()
+     except OSError:
+diff --git a/projects/amdsmi/docs/install/install.md b/projects/amdsmi/docs/install/install.md
+index 47ff01b1282..72a9963e9b8 100644
+--- a/projects/amdsmi/docs/install/install.md
++++ b/projects/amdsmi/docs/install/install.md
+@@ -16,6 +16,7 @@ AMD SMI supports:
+ 
+ - {ref}`AMD GPUs <rocm:release-supported-hw>` on Linux bare metal systems
+ - AMD GPUs in Linux virtual machine guests
++- AMD GPUs exposed through the HIP runtime on Windows Subsystem for Linux 2 (WSL2)
+ - AMD EPYC™ CPUs through the [esmi_ib_library](https://github.com/amd/esmi_ib_library)
+ 
+ For AMD SMI on Linux SR-IOV hosts, refer to
+@@ -33,7 +34,8 @@ requirements.
+ (install_amdgpu_driver)=
+ ### Driver requirements
+ 
+-To run AMD SMI, the following components need to be installed on your system:
++For Linux systems using the native `amdgpu`/KFD driver stack, install the applicable components
++below:
+ 
+ - The `amdgpu-dkms` driver
+   - For current amdgpu driver installation instructions, see the [AMD GPU
+@@ -62,6 +64,38 @@ To run AMD SMI, the following components need to be installed on your system:
+ Also confirm that your Linux kernel version matches the system requirements
+ described in {ref}`Operating system support <rocm:release-supported-os>`.
+ 
++#### WSL2 requirements and capabilities
++
++On WSL2, the GPU is exposed through the DirectX paravirtual device (`/dev/dxg`) instead of the
++native Linux `amdgpu` and KFD interfaces. Do not install `amdgpu-dkms` inside the WSL2
++distribution. Install a compatible Windows AMD GPU driver and a ROCm distribution that provides
++the HIP runtime library (`libamdhip64.so`) inside WSL2.
++
++AMD SMI automatically uses its HIP runtime fallback when all these conditions are true:
++
++- The Linux kernel version identifies the environment as Microsoft WSL.
++- `/dev/dxg` is present.
++- `/dev/kfd` is absent.
++- The HIP runtime reports at least one GPU.
++
++The WSL2 backend provides the subset of AMD SMI data for which WSL2 and the HIP runtime expose a
++source:
++
++| Capability | WSL2 support |
++| --- | --- |
++| GPU initialization and enumeration | Supported |
++| Device name, vendor, BDF, and UUID | Supported; PCI device ID is reported when available |
++| ASIC and board information | Partially supported; unavailable fields report `N/A` |
++| VRAM total and usage | Supported through `hipMemGetInfo` |
++| Separate GTT accounting | Not supported |
++| Per-process GPU accounting | Not available; process queries return an empty list |
++| Power, temperature, fan, activity, and clock telemetry | Not supported |
++| ECC/RAS, XGMI, partitioning, and management controls | Not supported |
++
++Unsupported queries return `AMDSMI_STATUS_NOT_SUPPORTED` or the corresponding documented
++unavailable value. The WSL2 fallback does not change behavior on systems where `/dev/kfd` is
++present.
++
+ ### Interface prerequisites
+ 
+ The following prerequisites apply to the AMD SMI library interfaces:
+diff --git a/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h b/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h
+index 6cb8554943d..b2096456a0a 100644
+--- a/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h
++++ b/projects/amdsmi/include/amd_smi/impl/amd_smi_system.h
+@@ -89,8 +89,8 @@ class AMDSmiSystem {
+   amdsmi_status_t populate_brcm_switch_devices();
+   uint64_t init_flag_;
+   AMDSmiDrm drm_;
+-  // True when GPUs were enumerated through the WSL2 HIP fallback (rsmi was never
+-  // initialized), so cleanup() must skip rsmi_shut_down(). See amd_smi_wsl.h.
++  // True when GPUs were enumerated through the WSL2 HIP fallback after rsmi_init()
++  // failed, so cleanup() ignores the best-effort rsmi_shut_down() status.
+   bool gpu_wsl_mode_ = false;
+   smi_nic_ctx_t ainic_ctx_;
+   std::vector<AMDSmiAINICDevice::AINICInfo> ai_nic_info_;
+diff --git a/projects/amdsmi/include/amd_smi/impl/amd_smi_test_internal.h b/projects/amdsmi/include/amd_smi/impl/amd_smi_test_internal.h
+index acbf78a982c..8916449b8d7 100644
+--- a/projects/amdsmi/include/amd_smi/impl/amd_smi_test_internal.h
++++ b/projects/amdsmi/include/amd_smi/impl/amd_smi_test_internal.h
+@@ -23,6 +23,8 @@
+ #ifndef AMD_SMI_INCLUDE_AMD_SMI_TEST_INTERNAL_H_
+ #define AMD_SMI_INCLUDE_AMD_SMI_TEST_INTERNAL_H_
+ 
++#include <cstddef>
++
+ #include "amd_smi/amdsmi.h"
+ #include "amd_smi/impl/amd_smi_test_flags.h"
+ 
+@@ -31,4 +33,25 @@
+ // extern-declare the rsmi_status_t function directly.
+ amdsmi_status_t amdsmi_test_sleep(amdsmi_processor_handle processor_handle, uint32_t seconds);
+ 
++namespace amd::smi {
++
++struct WslVramUsageBytes;
++
++using amdsmi_test_hip_get_device_fn = int (*)(int*);
++using amdsmi_test_hip_set_device_fn = int (*)(int);
++using amdsmi_test_hip_mem_get_info_fn = int (*)(size_t*, size_t*);
++
++// Exercises the WSL2 HIP device guard with injected HIP functions so tests can
++// verify device restoration without requiring a HIP runtime or GPU.
++bool amdsmi_test_wsl_scoped_device(amdsmi_test_hip_get_device_fn get_device,
++                                   amdsmi_test_hip_set_device_fn set_device, int target);
++
++// Exercises the exact-byte WSL2 memory query with injected HIP functions.
++amdsmi_status_t amdsmi_test_wsl_get_vram_usage_bytes(amdsmi_test_hip_get_device_fn get_device,
++                                                     amdsmi_test_hip_set_device_fn set_device,
++                                                     amdsmi_test_hip_mem_get_info_fn mem_get_info,
++                                                     int target, WslVramUsageBytes* usage);
++
++}  // namespace amd::smi
++
+ #endif  // AMD_SMI_INCLUDE_AMD_SMI_TEST_INTERNAL_H_
+diff --git a/projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h b/projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h
+index 996c55de6b5..c726131bb2c 100644
+--- a/projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h
++++ b/projects/amdsmi/include/amd_smi/impl/amd_smi_wsl.h
+@@ -65,12 +65,19 @@ namespace amd::smi {
+ 
+ /// Cached, mostly-static information for a single HIP-visible GPU on WSL2.
+ struct WslGpuInfo {
+-  int hip_index = -1;                  //!< HIP device ordinal (hipSetDevice index)
+-  std::string market_name;             //!< e.g. "AMD Radeon(TM) 8060S Graphics"
+-  std::string bdf_string;              //!< "domain:bus:device.function" from HIP
+-  amdsmi_bdf_t bdf = {};               //!< parsed BDF (0 fields if unknown)
+-  uint64_t device_id = 0;              //!< PCI device id if readable, else 0
+-  uint32_t num_compute_units = 0;      //!< CU count from HIP, 0 if unknown
++  int hip_index = -1;              //!< HIP device ordinal (hipSetDevice index)
++  std::string market_name;         //!< e.g. "AMD Radeon(TM) 8060S Graphics"
++  std::string bdf_string;          //!< "domain:bus:device.function" from HIP
++  amdsmi_bdf_t bdf = {};           //!< parsed BDF (0 fields if unknown)
++  uint64_t device_id = 0;          //!< PCI device id if readable, else 0
++  uint32_t num_compute_units = 0;  //!< CU count from HIP, 0 if unknown
++};
++
++/// Live HIP memory values in bytes, before conversion to the MB-based public
++/// amdsmi_vram_usage_t structure.
++struct WslVramUsageBytes {
++  uint64_t total = 0;
++  uint64_t used = 0;
+ };
+ 
+ /// Returns true if the current process is running inside WSL2.
+@@ -98,6 +105,13 @@ amdsmi_status_t wsl_fill_vram_info(const WslGpuInfo& gpu, amdsmi_vram_info_t* in
+ /// query (total/used change at runtime).
+ amdsmi_status_t wsl_fill_vram_usage(const WslGpuInfo& gpu, amdsmi_vram_usage_t* info);
+ 
++/// Query live total/used VRAM in bytes without the precision loss of the
++/// MB-based amdsmi_vram_usage_t structure.
++amdsmi_status_t wsl_get_vram_usage_bytes(const WslGpuInfo& gpu, WslVramUsageBytes* usage);
++
++/// Generate the deterministic WSL2 UUID from the HIP-visible device identity.
++amdsmi_status_t wsl_generate_device_uuid(const WslGpuInfo& gpu, char* uuid);
++
+ }  // namespace amd::smi
+ 
+ #endif  // AMD_SMI_INCLUDE_IMPL_AMD_SMI_WSL_H_
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi.cc b/projects/amdsmi/src/amd_smi/amd_smi.cc
+index 1ed2cdd88de..29f9e1d9f43 100644
+--- a/projects/amdsmi/src/amd_smi/amd_smi.cc
++++ b/projects/amdsmi/src/amd_smi/amd_smi.cc
+@@ -1305,15 +1305,7 @@ amdsmi_status_t amdsmi_get_gpu_device_uuid(amdsmi_processor_handle processor_han
+     amd::smi::AMDSmiGPUDevice* wsl_device = nullptr;
+     if (get_gpu_device_from_handle(processor_handle, &wsl_device) == AMDSMI_STATUS_SUCCESS &&
+         wsl_device->is_wsl()) {
+-      const auto& w = wsl_device->get_wsl_info();
+-      uint16_t wsl_dev_id = (w.device_id != 0) ? static_cast<uint16_t>(w.device_id & 0xFFFF)
+-                                               : std::numeric_limits<uint16_t>::max();
+-      // Pack domain:bus:device.function into the serial so each GPU is distinct.
+-      uint64_t wsl_serial = (static_cast<uint64_t>(w.bdf.bdf.domain_number) << 24) |
+-                            (static_cast<uint64_t>(w.bdf.bdf.bus_number) << 16) |
+-                            (static_cast<uint64_t>(w.bdf.bdf.device_number) << 8) |
+-                            (static_cast<uint64_t>(w.bdf.bdf.function_number));
+-      return amdsmi_uuid_gen(uuid, wsl_serial, wsl_dev_id, /*partition=*/0xff);
++      return amd::smi::wsl_generate_device_uuid(wsl_device->get_wsl_info(), uuid);
+     }
+   }
+ 
+@@ -4405,54 +4397,52 @@ amdsmi_status_t amdsmi_get_gpu_memory_reserved_pages(amdsmi_processor_handle pro
+   return rsmi_wrapper(rsmi_dev_memory_reserved_pages_get, processor_handle, 0, num_pages,
+                       reinterpret_cast<rsmi_retired_page_record_t*>(records));
+ }
++
++enum class WslMemoryValue { kTotal, kUsed };
++
++static bool get_wsl_gpu_memory_value(amdsmi_processor_handle processor_handle,
++                                     amdsmi_memory_type_t mem_type, WslMemoryValue requested_value,
++                                     uint64_t* value, amdsmi_status_t* status) {
++  amd::smi::AMDSmiGPUDevice* gpu_device = nullptr;
++  if (get_gpu_device_from_handle(processor_handle, &gpu_device) != AMDSMI_STATUS_SUCCESS ||
++      !gpu_device->is_wsl()) {
++    return false;
++  }
++
++  if (value == nullptr) {
++    *status = AMDSMI_STATUS_INVAL;
++    return true;
++  }
++  // HIP only exposes the device VRAM pool on WSL2; there is no separate GTT accounting.
++  if (mem_type != AMDSMI_MEM_TYPE_VRAM && mem_type != AMDSMI_MEM_TYPE_VIS_VRAM) {
++    *status = AMDSMI_STATUS_NOT_SUPPORTED;
++    return true;
++  }
++
++  amd::smi::WslVramUsageBytes usage;
++  *status = amd::smi::wsl_get_vram_usage_bytes(gpu_device->get_wsl_info(), &usage);
++  if (*status != AMDSMI_STATUS_SUCCESS) {
++    return true;
++  }
++  *value = requested_value == WslMemoryValue::kTotal ? usage.total : usage.used;
++  return true;
++}
++
+ amdsmi_status_t amdsmi_get_gpu_memory_total(amdsmi_processor_handle processor_handle,
+                                             amdsmi_memory_type_t mem_type, uint64_t* total) {
+-  {
+-    amd::smi::AMDSmiGPUDevice* gpu_device = nullptr;
+-    if (get_gpu_device_from_handle(processor_handle, &gpu_device) == AMDSMI_STATUS_SUCCESS &&
+-        gpu_device->is_wsl()) {
+-      if (total == nullptr) {
+-        return AMDSMI_STATUS_INVAL;
+-      }
+-      // HIP (hipMemGetInfo) only exposes the device VRAM pool on WSL2; there is
+-      // no separate GTT accounting, so honor the requested type explicitly.
+-      if (mem_type != AMDSMI_MEM_TYPE_VRAM && mem_type != AMDSMI_MEM_TYPE_VIS_VRAM) {
+-        return AMDSMI_STATUS_NOT_SUPPORTED;
+-      }
+-      amdsmi_vram_usage_t vu{};
+-      amdsmi_status_t wr = amd::smi::wsl_fill_vram_usage(gpu_device->get_wsl_info(), &vu);
+-      if (wr != AMDSMI_STATUS_SUCCESS) {
+-        return wr;
+-      }
+-      *total = static_cast<uint64_t>(vu.vram_total) * 1024ULL * 1024ULL;
+-      return AMDSMI_STATUS_SUCCESS;
+-    }
++  amdsmi_status_t status = AMDSMI_STATUS_SUCCESS;
++  if (get_wsl_gpu_memory_value(processor_handle, mem_type, WslMemoryValue::kTotal, total,
++                               &status)) {
++    return status;
+   }
+   return rsmi_wrapper(rsmi_dev_memory_total_get, processor_handle, 0,
+                       static_cast<rsmi_memory_type_t>(mem_type), total);
+ }
+ amdsmi_status_t amdsmi_get_gpu_memory_usage(amdsmi_processor_handle processor_handle,
+                                             amdsmi_memory_type_t mem_type, uint64_t* used) {
+-  {
+-    amd::smi::AMDSmiGPUDevice* gpu_device = nullptr;
+-    if (get_gpu_device_from_handle(processor_handle, &gpu_device) == AMDSMI_STATUS_SUCCESS &&
+-        gpu_device->is_wsl()) {
+-      if (used == nullptr) {
+-        return AMDSMI_STATUS_INVAL;
+-      }
+-      // HIP (hipMemGetInfo) only exposes the device VRAM pool on WSL2; there is
+-      // no separate GTT accounting, so honor the requested type explicitly.
+-      if (mem_type != AMDSMI_MEM_TYPE_VRAM && mem_type != AMDSMI_MEM_TYPE_VIS_VRAM) {
+-        return AMDSMI_STATUS_NOT_SUPPORTED;
+-      }
+-      amdsmi_vram_usage_t vu{};
+-      amdsmi_status_t wr = amd::smi::wsl_fill_vram_usage(gpu_device->get_wsl_info(), &vu);
+-      if (wr != AMDSMI_STATUS_SUCCESS) {
+-        return wr;
+-      }
+-      *used = static_cast<uint64_t>(vu.vram_used) * 1024ULL * 1024ULL;
+-      return AMDSMI_STATUS_SUCCESS;
+-    }
++  amdsmi_status_t status = AMDSMI_STATUS_SUCCESS;
++  if (get_wsl_gpu_memory_value(processor_handle, mem_type, WslMemoryValue::kUsed, used, &status)) {
++    return status;
+   }
+   return rsmi_wrapper(rsmi_dev_memory_usage_get, processor_handle, 0,
+                       static_cast<rsmi_memory_type_t>(mem_type), used);
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi_system.cc b/projects/amdsmi/src/amd_smi/amd_smi_system.cc
+index 1a6d4c875d9..b5ee2128782 100644
+--- a/projects/amdsmi/src/amd_smi/amd_smi_system.cc
++++ b/projects/amdsmi/src/amd_smi/amd_smi_system.cc
+@@ -31,6 +31,7 @@
+ #include <fstream>
+ #include <iomanip>
+ #include <sstream>
++#include <tuple>
+ 
+ #include "amd_smi/impl/amd_smi_gpu_device.h"
+ #ifdef BRCM_NIC
+@@ -754,14 +755,12 @@ amdsmi_status_t AMDSmiSystem::cleanup() {
+       sockets_.clear();
+     }
+     drm_.cleanup();
+-    // On the WSL2 HIP fallback path rsmi_init() was never successfully called
+-    // (the amdgpu/KFD driver is absent), so calling rsmi_shut_down() here would
+-    // return an init error. Skip it in that case.
+-    if (!gpu_wsl_mode_) {
+-      rsmi_status_t ret = rsmi_shut_down();
+-      if (ret != RSMI_STATUS_SUCCESS) {
+-        return amd::smi::rsmi_to_amdsmi_status(ret);
+-      }
++    // A failed rsmi_init() can still leave partial state. Clean it up on the
++    // WSL2 fallback path, but ignore the expected not-initialized status.
++    if (gpu_wsl_mode_) {
++      std::ignore = rsmi_shut_down();
++    } else if (auto rsmi_status_code = rsmi_shut_down(); rsmi_status_code != RSMI_STATUS_SUCCESS) {
++      return amd::smi::rsmi_to_amdsmi_status(rsmi_status_code);
+     }
+     gpu_wsl_mode_ = false;
+   }
+diff --git a/projects/amdsmi/src/amd_smi/amd_smi_wsl.cc b/projects/amdsmi/src/amd_smi/amd_smi_wsl.cc
+index cb08f027083..63d2e501cf9 100644
+--- a/projects/amdsmi/src/amd_smi/amd_smi_wsl.cc
++++ b/projects/amdsmi/src/amd_smi/amd_smi_wsl.cc
+@@ -37,6 +37,8 @@
+ #include <vector>
+ 
+ #include "amd_smi/impl/amd_smi_lib_loader.h"
++#include "amd_smi/impl/amd_smi_test_internal.h"
++#include "amd_smi/impl/amd_smi_uuid.h"
+ 
+ // When amdsmi happens to be compiled in a HIP-aware environment (a HIP platform
+ // macro is predefined AND the runtime headers are reachable) pull in the HIP
+@@ -44,10 +46,10 @@
+ // time. In the normal amdsmi build (plain g++, no HIP headers on the include
+ // path) neither guard holds, nothing is included, and the build is unaffected.
+ #if defined(__HIP_PLATFORM_AMD__) && defined(__has_include)
+-#  if __has_include(<hip/hip_runtime_api.h>)
+-#    include <hip/hip_runtime_api.h>
+-#    define AMDSMI_WSL_HIP_HEADERS_AVAILABLE 1
+-#  endif
++#if __has_include(<hip/hip_runtime_api.h>)
++#include <hip/hip_runtime_api.h>
++#define AMDSMI_WSL_HIP_HEADERS_AVAILABLE 1
++#endif
+ #endif
+ 
+ namespace amd::smi {
+@@ -105,7 +107,10 @@ HipRuntime& hip_runtime() {
+   std::call_once(once, [&]() {
+     // Prefer the unversioned dev symlink, then common SONAME versions.
+     const char* candidates[] = {
+-        "libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5",
++        "libamdhip64.so",
++        "libamdhip64.so.7",
++        "libamdhip64.so.6",
++        "libamdhip64.so.5",
+     };
+     bool loaded = false;
+     for (const char* name : candidates) {
+@@ -154,15 +159,18 @@ void set_fixed_string(char* dst, size_t cap, const std::string& src) {
+ class ScopedHipDevice {
+  public:
+   ScopedHipDevice(const HipRuntime& hip, int target) : hip_(hip) {
+-    if (hip_.GetDevice != nullptr && hip_.GetDevice(&prev_) == kHipSuccess) {
+-      have_prev_ = true;
+-    }
++    have_prev_ = hip_.GetDevice != nullptr && hip_.GetDevice(&prev_) == kHipSuccess;
+     if (hip_.SetDevice != nullptr && hip_.SetDevice(target) == kHipSuccess) {
+       set_ok_ = true;
++      if (!have_prev_) {
++        // HIP defaults a thread without a current context to device 0.
++        prev_ = 0;
++        have_prev_ = true;
++      }
+     }
+   }
+   ~ScopedHipDevice() {
+-    if (have_prev_ && hip_.SetDevice != nullptr) {
++    if (set_ok_ && have_prev_ && hip_.SetDevice != nullptr) {
+       hip_.SetDevice(prev_);
+     }
+   }
+@@ -178,6 +186,29 @@ class ScopedHipDevice {
+   bool set_ok_ = false;
+ };
+ 
++amdsmi_status_t get_vram_usage_bytes(const HipRuntime& hip, int hip_index,
++                                     WslVramUsageBytes* usage) {
++  if (usage == nullptr) {
++    return AMDSMI_STATUS_INVAL;
++  }
++  *usage = {};
++  if (!hip.available) {
++    return AMDSMI_STATUS_NOT_SUPPORTED;
++  }
++
++  ScopedHipDevice dev_guard(hip, hip_index);
++  if (!dev_guard.set_ok()) {
++    return AMDSMI_STATUS_API_FAILED;
++  }
++  size_t free_bytes = 0;
++  size_t total_bytes = 0;
++  if (hip.MemGetInfo == nullptr || hip.MemGetInfo(&free_bytes, &total_bytes) != kHipSuccess) {
++    return AMDSMI_STATUS_API_FAILED;
++  }
++  usage->total = static_cast<uint64_t>(total_bytes);
++  usage->used = total_bytes >= free_bytes ? static_cast<uint64_t>(total_bytes - free_bytes) : 0;
++  return AMDSMI_STATUS_SUCCESS;
++}
+ 
+ // Parse a HIP "domain:bus:device.function" string (e.g. "0000:c5:00.0") into an
+ // amdsmi_bdf_t. Returns false if the string is not in the expected form.
+@@ -304,8 +335,7 @@ amdsmi_status_t wsl_discover_gpus(std::vector<WslGpuInfo>* out) {
+     // Compute-unit count via the ABI-stable attribute query (best effort).
+     if (hip.DeviceGetAttribute != nullptr) {
+       int cu = 0;
+-      if (hip.DeviceGetAttribute(&cu, kHipDeviceAttributeMultiprocessorCount, i) ==
+-              kHipSuccess &&
++      if (hip.DeviceGetAttribute(&cu, kHipDeviceAttributeMultiprocessorCount, i) == kHipSuccess &&
+           cu > 0) {
+         gpu.num_compute_units = static_cast<uint32_t>(cu);
+       }
+@@ -381,22 +411,13 @@ amdsmi_status_t wsl_fill_vram_info(const WslGpuInfo& gpu, amdsmi_vram_info_t* in
+   info->vram_bit_width = std::numeric_limits<uint32_t>::max();
+   info->vram_max_bandwidth = std::numeric_limits<uint64_t>::max();
+ 
+-  // VRAM size is queried live (instead of being cached during enumeration) so
+-  // that merely listing devices does not create a HIP context on every GPU.
+-  HipRuntime& hip = hip_runtime();
+-  if (!hip.available) {
+-    return AMDSMI_STATUS_NOT_SUPPORTED;
+-  }
+-  ScopedHipDevice dev_guard(hip, gpu.hip_index);
+-  if (!dev_guard.set_ok()) {
+-    return AMDSMI_STATUS_API_FAILED;
+-  }
+-  size_t free_bytes = 0, total_bytes = 0;
+-  if (hip.MemGetInfo(&free_bytes, &total_bytes) != kHipSuccess) {
+-    return AMDSMI_STATUS_API_FAILED;
++  WslVramUsageBytes usage;
++  amdsmi_status_t status = wsl_get_vram_usage_bytes(gpu, &usage);
++  if (status != AMDSMI_STATUS_SUCCESS) {
++    return status;
+   }
+   // hipMemGetInfo reports bytes; amdsmi_vram_info_t.vram_size is in MB.
+-  info->vram_size = total_bytes / (1024ULL * 1024ULL);
++  info->vram_size = usage.total / (1024ULL * 1024ULL);
+   return AMDSMI_STATUS_SUCCESS;
+ }
+ 
+@@ -406,22 +427,52 @@ amdsmi_status_t wsl_fill_vram_usage(const WslGpuInfo& gpu, amdsmi_vram_usage_t*
+   }
+   *info = {};
+ 
+-  HipRuntime& hip = hip_runtime();
+-  if (!hip.available) {
+-    return AMDSMI_STATUS_NOT_SUPPORTED;
+-  }
+-  ScopedHipDevice dev_guard(hip, gpu.hip_index);
+-  if (!dev_guard.set_ok()) {
+-    return AMDSMI_STATUS_API_FAILED;
+-  }
+-  size_t free_bytes = 0, total_bytes = 0;
+-  if (hip.MemGetInfo(&free_bytes, &total_bytes) != kHipSuccess) {
+-    return AMDSMI_STATUS_API_FAILED;
++  WslVramUsageBytes usage;
++  amdsmi_status_t status = wsl_get_vram_usage_bytes(gpu, &usage);
++  if (status != AMDSMI_STATUS_SUCCESS) {
++    return status;
+   }
+-  const uint64_t used_bytes = (total_bytes >= free_bytes) ? (total_bytes - free_bytes) : 0;
+-  info->vram_total = static_cast<uint32_t>(total_bytes / (1024ULL * 1024ULL));
+-  info->vram_used = static_cast<uint32_t>(used_bytes / (1024ULL * 1024ULL));
++  info->vram_total = static_cast<uint32_t>(usage.total / (1024ULL * 1024ULL));
++  info->vram_used = static_cast<uint32_t>(usage.used / (1024ULL * 1024ULL));
+   return AMDSMI_STATUS_SUCCESS;
+ }
+ 
++amdsmi_status_t wsl_get_vram_usage_bytes(const WslGpuInfo& gpu, WslVramUsageBytes* usage) {
++  return get_vram_usage_bytes(hip_runtime(), gpu.hip_index, usage);
++}
++
++amdsmi_status_t wsl_generate_device_uuid(const WslGpuInfo& gpu, char* uuid) {
++  if (uuid == nullptr) {
++    return AMDSMI_STATUS_INVAL;
++  }
++  const uint16_t device_id = gpu.device_id != 0 ? static_cast<uint16_t>(gpu.device_id & 0xFFFF)
++                                                : std::numeric_limits<uint16_t>::max();
++  const uint64_t serial = (static_cast<uint64_t>(gpu.bdf.bdf.domain_number) << 24) |
++                          (static_cast<uint64_t>(gpu.bdf.bdf.bus_number) << 16) |
++                          (static_cast<uint64_t>(gpu.bdf.bdf.device_number) << 8) |
++                          static_cast<uint64_t>(gpu.bdf.bdf.function_number);
++  return amdsmi_uuid_gen(uuid, serial, device_id, /*idx=*/0xff);
++}
++
++bool amdsmi_test_wsl_scoped_device(amdsmi_test_hip_get_device_fn get_device,
++                                   amdsmi_test_hip_set_device_fn set_device, int target) {
++  HipRuntime hip;
++  hip.GetDevice = get_device;
++  hip.SetDevice = set_device;
++  ScopedHipDevice device_guard(hip, target);
++  return device_guard.set_ok();
++}
++
++amdsmi_status_t amdsmi_test_wsl_get_vram_usage_bytes(amdsmi_test_hip_get_device_fn get_device,
++                                                     amdsmi_test_hip_set_device_fn set_device,
++                                                     amdsmi_test_hip_mem_get_info_fn mem_get_info,
++                                                     int target, WslVramUsageBytes* usage) {
++  HipRuntime hip;
++  hip.available = true;
++  hip.GetDevice = get_device;
++  hip.SetDevice = set_device;
++  hip.MemGetInfo = mem_get_info;
++  return get_vram_usage_bytes(hip, target, usage);
++}
++
+ }  // namespace amd::smi
+diff --git a/projects/amdsmi/tests/amd_smi_test/functional/wsl.cc b/projects/amdsmi/tests/amd_smi_test/functional/wsl.cc
+new file mode 100644
+index 00000000000..0e356b72255
+--- /dev/null
++++ b/projects/amdsmi/tests/amd_smi_test/functional/wsl.cc
+@@ -0,0 +1,212 @@
++/*
++ * Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#include <gtest/gtest.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "amd_smi/impl/amd_smi_test_internal.h"
++#include "amd_smi/impl/amd_smi_wsl.h"
++
++namespace {
++
++constexpr int kHipSuccess = 0;
++constexpr int kHipError = 1;
++
++int get_device_status = kHipSuccess;
++int current_device = 0;
++int set_device_status = kHipSuccess;
++int mem_get_info_status = kHipSuccess;
++size_t mock_free_bytes = 0;
++size_t mock_total_bytes = 0;
++uint32_t mem_get_info_calls = 0;
++std::vector<int> set_device_calls;
++
++int TestGetDevice(int* device) {
++  if (get_device_status == kHipSuccess) {
++    *device = current_device;
++  }
++  return get_device_status;
++}
++
++int TestSetDevice(int device) {
++  set_device_calls.push_back(device);
++  return set_device_status;
++}
++
++int TestMemGetInfo(size_t* free_bytes, size_t* total_bytes) {
++  ++mem_get_info_calls;
++  if (mem_get_info_status == kHipSuccess) {
++    *free_bytes = mock_free_bytes;
++    *total_bytes = mock_total_bytes;
++  }
++  return mem_get_info_status;
++}
++
++class WslScopedDeviceTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    get_device_status = kHipSuccess;
++    current_device = 0;
++    set_device_status = kHipSuccess;
++    mem_get_info_status = kHipSuccess;
++    mock_free_bytes = 0;
++    mock_total_bytes = 0;
++    mem_get_info_calls = 0;
++    set_device_calls.clear();
++  }
++};
++
++TEST_F(WslScopedDeviceTest, RestoresSavedDevice) {
++  current_device = 3;
++
++  EXPECT_TRUE(amd::smi::amdsmi_test_wsl_scoped_device(TestGetDevice, TestSetDevice, 7));
++  EXPECT_EQ(set_device_calls, (std::vector<int>{7, 3}));
++}
++
++TEST_F(WslScopedDeviceTest, FallsBackToDeviceZeroWhenGetDeviceFails) {
++  get_device_status = kHipError;
++
++  EXPECT_TRUE(amd::smi::amdsmi_test_wsl_scoped_device(TestGetDevice, TestSetDevice, 7));
++  EXPECT_EQ(set_device_calls, (std::vector<int>{7, 0}));
++}
++
++TEST_F(WslScopedDeviceTest, DoesNotRestoreWhenSetDeviceFails) {
++  current_device = 3;
++  set_device_status = kHipError;
++
++  EXPECT_FALSE(amd::smi::amdsmi_test_wsl_scoped_device(TestGetDevice, TestSetDevice, 7));
++  EXPECT_EQ(set_device_calls, (std::vector<int>{7}));
++}
++
++TEST_F(WslScopedDeviceTest, ReturnsExactMemoryBytesAndRestoresDevice) {
++  current_device = 3;
++  mock_total_bytes = 109679810150ULL;
++  mock_free_bytes = 109600118374ULL;
++  amd::smi::WslVramUsageBytes usage;
++
++  EXPECT_EQ(amd::smi::amdsmi_test_wsl_get_vram_usage_bytes(TestGetDevice, TestSetDevice,
++                                                           TestMemGetInfo, 7, &usage),
++            AMDSMI_STATUS_SUCCESS);
++  EXPECT_EQ(usage.total, 109679810150ULL);
++  EXPECT_EQ(usage.used, 79691776ULL);
++  EXPECT_EQ(mem_get_info_calls, 1U);
++  EXPECT_EQ(set_device_calls, (std::vector<int>{7, 3}));
++}
++
++TEST_F(WslScopedDeviceTest, RestoresDeviceWhenMemoryQueryFails) {
++  current_device = 3;
++  mem_get_info_status = kHipError;
++  amd::smi::WslVramUsageBytes usage;
++
++  EXPECT_EQ(amd::smi::amdsmi_test_wsl_get_vram_usage_bytes(TestGetDevice, TestSetDevice,
++                                                           TestMemGetInfo, 7, &usage),
++            AMDSMI_STATUS_API_FAILED);
++  EXPECT_EQ(mem_get_info_calls, 1U);
++  EXPECT_EQ(set_device_calls, (std::vector<int>{7, 3}));
++}
++
++TEST_F(WslScopedDeviceTest, ClampsUsedBytesWhenFreeExceedsTotal) {
++  mock_total_bytes = 100;
++  mock_free_bytes = 200;
++  amd::smi::WslVramUsageBytes usage;
++
++  EXPECT_EQ(amd::smi::amdsmi_test_wsl_get_vram_usage_bytes(TestGetDevice, TestSetDevice,
++                                                           TestMemGetInfo, 7, &usage),
++            AMDSMI_STATUS_SUCCESS);
++  EXPECT_EQ(usage.total, 100U);
++  EXPECT_EQ(usage.used, 0U);
++}
++
++TEST_F(WslScopedDeviceTest, DoesNotQueryMemoryWhenSetDeviceFails) {
++  current_device = 3;
++  set_device_status = kHipError;
++  amd::smi::WslVramUsageBytes usage;
++
++  EXPECT_EQ(amd::smi::amdsmi_test_wsl_get_vram_usage_bytes(TestGetDevice, TestSetDevice,
++                                                           TestMemGetInfo, 7, &usage),
++            AMDSMI_STATUS_API_FAILED);
++  EXPECT_EQ(mem_get_info_calls, 0U);
++  EXPECT_EQ(set_device_calls, (std::vector<int>{7}));
++}
++
++TEST(amdsmitstReadOnly, WslFillAsicInfo) {
++  amd::smi::WslGpuInfo gpu;
++  gpu.market_name = "AMD Radeon Test GPU";
++  gpu.device_id = 0x1586;
++  gpu.num_compute_units = 40;
++  amdsmi_asic_info_t info{};
++
++  ASSERT_EQ(amd::smi::wsl_fill_asic_info(gpu, &info), AMDSMI_STATUS_SUCCESS);
++  EXPECT_STREQ(info.market_name, "AMD Radeon Test GPU");
++  EXPECT_EQ(info.vendor_id, 0x1002U);
++  EXPECT_EQ(info.device_id, 0x1586U);
++  EXPECT_EQ(info.num_of_compute_units, 40U);
++  EXPECT_EQ(info.rev_id, UINT32_MAX);
++}
++
++TEST(amdsmitstReadOnly, WslFillBoardInfo) {
++  amd::smi::WslGpuInfo gpu;
++  gpu.market_name = "AMD Radeon Test GPU";
++  amdsmi_board_info_t info{};
++
++  ASSERT_EQ(amd::smi::wsl_fill_board_info(gpu, &info), AMDSMI_STATUS_SUCCESS);
++  EXPECT_STREQ(info.product_name, "AMD Radeon Test GPU");
++  EXPECT_STREQ(info.manufacturer_name, "Advanced Micro Devices, Inc. [AMD/ATI]");
++}
++
++TEST(amdsmitstReadOnly, WslFillInfoRejectsNullOutput) {
++  const amd::smi::WslGpuInfo gpu;
++
++  EXPECT_EQ(amd::smi::wsl_fill_asic_info(gpu, nullptr), AMDSMI_STATUS_INVAL);
++  EXPECT_EQ(amd::smi::wsl_fill_board_info(gpu, nullptr), AMDSMI_STATUS_INVAL);
++  EXPECT_EQ(amd::smi::wsl_fill_vram_info(gpu, nullptr), AMDSMI_STATUS_INVAL);
++  EXPECT_EQ(amd::smi::wsl_fill_vram_usage(gpu, nullptr), AMDSMI_STATUS_INVAL);
++  EXPECT_EQ(amd::smi::wsl_get_vram_usage_bytes(gpu, nullptr), AMDSMI_STATUS_INVAL);
++  EXPECT_EQ(amd::smi::wsl_generate_device_uuid(gpu, nullptr), AMDSMI_STATUS_INVAL);
++}
++
++TEST(amdsmitstReadOnly, WslUuidIsStableAndDistinctByBdf) {
++  amd::smi::WslGpuInfo first;
++  first.device_id = 0x1586;
++  first.bdf.bdf.domain_number = 0;
++  first.bdf.bdf.bus_number = 0xc3;
++  first.bdf.bdf.device_number = 0;
++  first.bdf.bdf.function_number = 0;
++  amd::smi::WslGpuInfo second = first;
++  second.bdf.bdf.bus_number = 0xc4;
++  char first_uuid[AMDSMI_GPU_UUID_SIZE] = {};
++  char first_uuid_again[AMDSMI_GPU_UUID_SIZE] = {};
++  char second_uuid[AMDSMI_GPU_UUID_SIZE] = {};
++
++  ASSERT_EQ(amd::smi::wsl_generate_device_uuid(first, first_uuid), AMDSMI_STATUS_SUCCESS);
++  ASSERT_EQ(amd::smi::wsl_generate_device_uuid(first, first_uuid_again), AMDSMI_STATUS_SUCCESS);
++  ASSERT_EQ(amd::smi::wsl_generate_device_uuid(second, second_uuid), AMDSMI_STATUS_SUCCESS);
++  EXPECT_STREQ(first_uuid, first_uuid_again);
++  EXPECT_NE(std::strcmp(first_uuid, second_uuid), 0);
++}
++
++}  // namespace
+diff --git a/projects/amdsmi/tests/python/unit/system/test_wsl_detection.py b/projects/amdsmi/tests/python/unit/system/test_wsl_detection.py
+new file mode 100644
+index 00000000000..374b9540edc
+--- /dev/null
++++ b/projects/amdsmi/tests/python/unit/system/test_wsl_detection.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++#
++# Copyright (C) Advanced Micro Devices. All rights reserved.
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy of
++# this software and associated documentation files (the "Software"), to deal in
++# the Software without restriction, including without limitation the rights to
++# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++# the Software, and to permit persons to whom the Software is furnished to do so,
++# subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++"""WSL2 GPU detection unit tests for the AMD SMI CLI initializer."""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from types import ModuleType, SimpleNamespace
++from unittest.mock import Mock, patch
++
++
++def _find_amdsmi_init(test_file):
++    test_path = Path(test_file).resolve()
++    candidates = (
++        test_path.parents[4] / "amdsmi_cli" / "amdsmi_init.py",
++        test_path.parents[6] / "libexec" / "amdsmi_cli" / "amdsmi_init.py",
++    )
++    for candidate in candidates:
++        if candidate.is_file():
++            return candidate
++    raise FileNotFoundError(f"Unable to find amdsmi_init.py in: {candidates}")
++
++
++class TestAmdSmiCliWslDetection(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        class FakeInitFlags:
++            INIT_ALL_PROCESSORS = 0
++            INIT_AMD_GPUS = 1
++            INIT_AMD_CPUS = 2
++            INIT_AMD_NICS = 4
++
++        class FakeLibraryException(Exception):
++            err_code = 0
++
++        fake_wrapper = SimpleNamespace(AMDSMI_STATUS_NOT_INIT=1, AMDSMI_STATUS_DRIVER_NOT_LOADED=2)
++        fake_interface = SimpleNamespace(
++            AmdSmiInitFlags=FakeInitFlags,
++            AmdSmiLibraryException=FakeLibraryException,
++            AmdSmiParameterException=FakeLibraryException,
++            amdsmi_wrapper=fake_wrapper,
++            amdsmi_init=lambda _flags: None,
++            amdsmi_shut_down=lambda: None,
++        )
++        fake_amdsmi = ModuleType("amdsmi")
++        fake_amdsmi.amdsmi_interface = fake_interface
++        fake_amdsmi.amdsmi_exception = SimpleNamespace(AmdSmiLibraryException=FakeLibraryException)
++
++        module_path = _find_amdsmi_init(__file__)
++        spec = importlib.util.spec_from_file_location("_amdsmi_init_wsl_test", module_path)
++        if spec is None or spec.loader is None:
++            raise RuntimeError(f"Unable to load {module_path}")
++        module = importlib.util.module_from_spec(spec)
++        with (
++            patch.dict(sys.modules, {"amdsmi": fake_amdsmi}),
++            patch("atexit.register"),
++            patch("signal.signal"),
++        ):
++            spec.loader.exec_module(module)
++        cls.amdsmi_init = module
++
++    def check_wsl2_gpu(self, proc_version, dxg_exists, kfd_exists):
++        proc_path = Mock()
++        proc_path.read_text.return_value = proc_version
++        dxg_path = Mock()
++        dxg_path.exists.return_value = dxg_exists
++        kfd_path = Mock()
++        kfd_path.exists.return_value = kfd_exists
++        paths = {"/proc/version": proc_path, "/dev/dxg": dxg_path, "/dev/kfd": kfd_path}
++        with patch.object(self.amdsmi_init, "Path", side_effect=paths.__getitem__):
++            return self.amdsmi_init.check_wsl2_gpu()
++
++    def test_check_wsl2_gpu_detection_matrix(self):
++        cases = (
++            ("Linux microsoft-standard-WSL2", True, False, True),
++            ("Linux WSL2 kernel", True, False, True),
++            ("Linux version 6.8.0", True, False, False),
++            ("Linux microsoft-standard-WSL2", False, False, False),
++            ("Linux microsoft-standard-WSL2", True, True, False),
++        )
++        for proc_version, dxg_exists, kfd_exists, expected in cases:
++            with self.subTest(
++                proc_version=proc_version, dxg_exists=dxg_exists, kfd_exists=kfd_exists
++            ):
++                self.assertEqual(
++                    self.check_wsl2_gpu(proc_version, dxg_exists, kfd_exists), expected
++                )
++
++    def test_check_wsl2_gpu_handles_proc_read_error(self):
++        proc_path = Mock()
++        proc_path.read_text.side_effect = OSError
++        with patch.object(self.amdsmi_init, "Path", return_value=proc_path):
++            self.assertFalse(self.amdsmi_init.check_wsl2_gpu())
++
++    def test_find_amdsmi_init_in_install_layout(self):
++        with tempfile.TemporaryDirectory() as prefix:
++            prefix_path = Path(prefix)
++            test_path = (
++                prefix_path
++                / "share"
++                / "amd_smi"
++                / "tests"
++                / "python_unittest"
++                / "unit"
++                / "system"
++                / "test_wsl_detection.py"
++            )
++            module_path = prefix_path / "libexec" / "amdsmi_cli" / "amdsmi_init.py"
++            module_path.parent.mkdir(parents=True)
++            module_path.touch()
++            self.assertEqual(_find_amdsmi_init(test_path), module_path)
