@@ -51,6 +51,9 @@ stdenv.mkDerivation (finalAttrs: {
     # Fix error: redefinition of 'struct drm_color_ctm_3x4'
     # https://github.com/ROCm/amdsmi/pull/165
     ./drm-struct-redefinition-fix.patch
+    # feat(amdsmi): add WSL2 GPU support via HIP runtime fallback
+    # https://github.com/ROCm/rocm-systems/pull/7246
+    ./amdsmi-wsl2-support.patch
   ];
 
   nativeBuildInputs = [
